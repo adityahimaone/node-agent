@@ -3,11 +3,11 @@
 # Usage:
 #   NODE_AGENT_TOKEN=<token> ./scripts/install-mac.sh
 # Optional overrides:
-#   NODE_AGENT_SERVER=http://100.80.220.71:8788  (default, tailscale IP VPS)
+#   NODE_AGENT_SERVER=http://100.64.0.1:8788  (default, tailscale IP VPS)
 #   NODE_AGENT_ID=mac                             (default)
 set -euo pipefail
 
-NODE_AGENT_SERVER="${NODE_AGENT_SERVER:-http://100.80.220.71:8788}"
+NODE_AGENT_SERVER="${NODE_AGENT_SERVER:-http://100.64.0.1:8788}"
 NODE_AGENT_TOKEN="${NODE_AGENT_TOKEN:?set NODE_AGENT_TOKEN before running (harus sama dengan token di VPS)}"
 NODE_AGENT_ID="${NODE_AGENT_ID:-mac}"
 INSTALL_DIR="$HOME/.hermes/bin"

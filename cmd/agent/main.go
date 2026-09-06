@@ -38,7 +38,7 @@ var busy int32
 func main() {
 	server := os.Getenv("NODE_AGENT_SERVER")
 	if server == "" {
-		server = "http://100.80.220.71:8788"
+		server = "http://100.64.0.1:8788"
 	}
 	nodeID := os.Getenv("NODE_AGENT_ID")
 	if nodeID == "" {

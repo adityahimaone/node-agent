@@ -4,13 +4,13 @@ Usage (PowerShell biasa, bukan admin):
   $env:NODE_AGENT_TOKEN = "<token-yang-sama-dengan-VPS>"
   .\scripts\install-windows.ps1
 Optional overrides:
-  $env:NODE_AGENT_SERVER = "http://100.80.220.71:8788"  (default)
+  $env:NODE_AGENT_SERVER = "http://100.64.0.1:8788"  (default)
   $env:NODE_AGENT_ID     = "windows"                     (default)
 #>
 
 $ErrorActionPreference = "Stop"
 
-$Server = if ($env:NODE_AGENT_SERVER) { $env:NODE_AGENT_SERVER } else { "http://100.80.220.71:8788" }
+$Server = if ($env:NODE_AGENT_SERVER) { $env:NODE_AGENT_SERVER } else { "http://100.64.0.1:8788" }
 if (-not $env:NODE_AGENT_TOKEN) {
     Write-Error "Set `$env:NODE_AGENT_TOKEN dulu sebelum run (harus sama dengan token di VPS)."
     exit 1
