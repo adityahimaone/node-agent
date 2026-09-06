@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agentic Flow — Adit</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#0a0a0a; --panel:#141414; --line:#232323; --text:#e8e6e1;
+    --muted:#8a8a85; --accent:#7fb2a8; --accent-dim:#3d5c56;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Inter", ui-sans-serif, system-ui, sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:var(--sans);background:var(--bg);color:var(--text);
+    display:flex;justify-content:center;padding:48px 16px;line-height:1.55}
+  .wrap{max-width:960px;width:100%}
+  .kicker{font-family:var(--mono);font-size:12px;color:var(--accent);margin:0 0 8px}
+  h1{font-size:28px;font-weight:600;margin:0 0 6px;letter-spacing:-0.01em}
+  .lede{color:var(--muted);font-size:15px;max-width:66ch;margin:0 0 32px}
+  .lede b{color:var(--text);font-weight:500}
+  section{margin-bottom:40px}
+  h2{font-size:14px;font-weight:600;color:var(--text);margin:0 0 4px;
+    padding-bottom:10px;border-bottom:1px solid var(--line)}
+  h2 span{color:var(--muted);font-weight:400;font-family:var(--mono);font-size:12px}
+
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+  th{text-align:left;color:var(--muted);font-weight:500;font-size:11px;padding:0 12px 8px 0}
+  td{padding:9px 12px 9px 0;border-top:1px solid var(--line);vertical-align:top}
+  td.was{color:var(--muted);text-decoration:line-through;text-decoration-color:#4a2b2b}
+  td code, .lede code, .note code{font-family:var(--mono);font-size:12px;
+    background:#1c1c1c;padding:1px 6px;border-radius:5px;color:#d8cfa8}
+
+  .diagram{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:20px;margin-top:16px}
+  .diagram .mermaid{display:flex;justify-content:center}
+
+  .legend{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px;font-size:12px}
+  .legend div{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:9px 11px;color:var(--muted)}
+  .legend b{color:var(--text);font-family:var(--mono);font-weight:600;margin-right:4px}
+
+  .dropped{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+  .dropped span{font-family:var(--mono);font-size:12px;color:#c98a8a;
+    border:1px solid #3a2222;background:#181111;padding:5px 10px;border-radius:6px}
+
+  .timeline{margin-top:14px;border-left:1px solid var(--line);padding-left:20px}
+  .tl-item{position:relative;padding-bottom:18px;font-size:13px}
+  .tl-item:last-child{padding-bottom:0}
+  .tl-item::before{content:"";position:absolute;left:-24.5px;top:5px;width:7px;height:7px;
+    border-radius:50%;background:var(--accent)}
+  .tl-item time{font-family:var(--mono);color:var(--accent);font-size:12px;margin-right:8px}
+  .tl-item p{margin:4px 0 0;color:var(--muted)}
+
+  .note{font-size:12px;color:var(--muted);margin-top:14px;padding-top:14px;
+    border-top:1px dashed var(--line)}
+  footer{font-size:11px;color:#5a5a55;font-family:var(--mono);margin-top:48px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="kicker">agentic-flow-adit · rev 3</p>
+  <h1>Otak di VPS, tangan di Mac/Windows lewat Tailscale</h1>
+  <p class="lede">Orchestrator, kanban, dan memory (Holographic) tinggal permanen di VPS. Eksekusi kode jalan
+    di mesin lokal (Mac/Windows) lewat <b>node-agent</b> — koneksi persisten, bukan SSH tiap dispatch —
+    dengan SSH sebagai fallback kalau stream putus. Ini realisasi dari konsep <b>Spaces</b> yang udah
+    dirancang buat Hermes WebUI.</p>
+
+  <section>
+    <h2>Kenapa node-agent, bukan SSH tiap task</h2>
+    <table>
+      <tr><th>Aspek</th><th>SSH per-dispatch</th><th>Node-agent (dipilih)</th></tr>
+      <tr><td>Koneksi</td><td class="was">handshake + auth ulang tiap task</td><td>satu stream persisten, reconnect otomatis kalau putus</td></tr>
+      <tr><td>Arah koneksi</td><td>VPS → local (sering ke-block NAT/wifi kantor)</td><td>local dial keluar ke VPS (identitas tailnet stabil)</td></tr>
+      <tr><td>Transport</td><td>shell exec, teks mentah</td><td>gRPC bidirectional stream — pola sama kayak transport Go↔Hermes yang udah jalan</td></tr>
+      <tr><td>Kalau stream mati</td><td>—</td><td>fallback otomatis ke SSH exec</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Alur <span>VPS (otak) ↔ node-agent (tangan)</span></h2>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart LR
+  subgraph VPS["VPS · otak"]
+    O["orchestrator<br/>Hermes + Codex · 9router"]
+    K["kanban<br/>lane_by_space"]
+    M[("Holographic<br/>fact_store.db")]
+  end
+  L["luvus pane<br/>hosted di VPS"]
+  T{{"Tailscale tailnet<br/>direct, no DERP"}}
+  NAmac["node-agent · Mac<br/>worktree + Codex + codegraph_explore"]
+  NAwin["node-agent · Windows<br/>worktree + Codex + codegraph_explore"]
+
+  L --> O
+  O --> K
+  K -- gRPC stream --> T
+  O -. call-graph RPC, on-demand .-> T
+  T --> NAmac
+  T --> NAwin
+  NAmac -- caveman result --> O
+  NAwin -- caveman result --> O
+  O --> M
+  M -. recall .-> O
+  T -. ssh fallback .-> NAmac
+  T -. ssh fallback .-> NAwin
+      </pre>
+    </div>
+    <div class="legend">
+      <div><b>O</b> plans + delegates, nulis ke &amp; recall dari memory</div>
+      <div><b>K</b> assign task ke space (mac/windows) berdasar lane</div>
+      <div><b>NA</b> node-agent — worktree per task, eksekusi Codex lokal, expose <code>codegraph_explore</code></div>
+      <div><b>call-graph RPC</b> orchestrator panggil langsung kapan aja — nggak nunggu kanban card</div>
+      <div><b>T</b> tailnet — pastiin direct via <code>tailscale ping</code>, bukan relay DERP</div>
+      <div><b>M</b> Holographic — fact_store.db, satu-satunya sumber konteks lintas mesin</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Install manifest <span>biar Hermes bisa auto-install</span></h2>
+    <table>
+      <tr><th>Komponen</th><th>Repo</th><th>Catatan</th></tr>
+      <tr><td>Hermes Agent</td><td><a href="https://github.com/NousResearch/hermes-agent">NousResearch/hermes-agent</a></td><td>orchestrator</td></tr>
+      <tr><td>Holographic memory</td><td><a href="https://github.com/bysc1000/holographic-memory">bysc1000/holographic-memory</a></td><td>plugin <code>hermes-memory-store</code></td></tr>
+      <tr><td>Codex</td><td><a href="https://github.com/openai/codex">openai/codex</a></td><td>worker lane</td></tr>
+      <tr><td>9router</td><td><a href="https://github.com/decolua/9router">decolua/9router</a></td><td>model routing</td></tr>
+      <tr><td>luvus</td><td><a href="https://github.com/RizRiyz/luvus">RizRiyz/luvus</a></td><td>session multiplexer</td></tr>
+      <tr><td>ponytail</td><td><a href="https://github.com/DietrichGebert/ponytail">DietrichGebert/ponytail</a></td><td>skill</td></tr>
+      <tr><td>caveman</td><td><a href="https://github.com/JuliusBrussee/caveman">JuliusBrussee/caveman</a></td><td>skill + <code>cavecrew</code></td></tr>
+      <tr><td>call-graph</td><td><a href="https://github.com/colbymchenry/codegraph">colbymchenry/codegraph</a></td><td>tool <code>codegraph_explore</code></td></tr>
+      <tr><td>worktrees</td><td><a href="https://github.com/tanvesh01/issue-workflow">tanvesh01/issue-workflow</a></td><td>belum pasti cocok — cek dulu</td></tr>
+      <tr><td>node-agent</td><td class="was">belum ada</td><td>perlu dibangun sendiri</td></tr>
+    </table>
+    <pre style="background:#0f0f0f;border:1px solid var(--line);border-radius:8px;padding:14px;margin-top:12px;font-size:12px;overflow-x:auto;font-family:var(--mono);color:#c9c5b8">{
+  "manifest": [
+    { "name": "hermes-agent", "repo": "NousResearch/hermes-agent", "role": "orchestrator" },
+    { "name": "holographic-memory", "repo": "bysc1000/holographic-memory", "role": "memory-plugin" },
+    { "name": "codex", "repo": "openai/codex", "role": "worker" },
+    { "name": "9router", "repo": "decolua/9router", "role": "model-router" },
+    { "name": "luvus", "repo": "RizRiyz/luvus", "role": "multiplexer" },
+    { "name": "ponytail", "repo": "DietrichGebert/ponytail", "role": "skill" },
+    { "name": "caveman", "repo": "JuliusBrussee/caveman", "role": "skill" },
+    { "name": "call-graph", "repo": "colbymchenry/codegraph", "role": "skill" },
+    { "name": "worktrees", "repo": "tanvesh01/issue-workflow", "role": "skill", "verified": false },
+    { "name": "node-agent", "repo": null, "role": "custom", "status": "todo" }
+  ]
+}</pre>
+  </section>
+
+  <section>
+    <h2>Skills <span>siapa jalan di mana</span></h2>
+    <table>
+      <tr><th>Skill</th><th>Jalan di</th><th>Perannya</th></tr>
+      <tr><td>ponytail</td><td>node-agent, sebelum kirim hasil</td><td>saring dulu — kalau cukup <code>lru_cache</code>, jangan bikin kelas custom. Ngirit round-trip ke VPS</td></tr>
+      <tr><td>caveman <code>full</code></td><td>payload gRPC stream</td><td>hasil node-agent → orchestrator terse. Ngurangin ukuran payload lewat tailnet, bukan cuma hemat context</td></tr>
+      <tr><td>call-graph</td><td>node-agent (butuh akses codebase lokal)</td><td><code>codegraph_explore</code>+LSP lokal, yang dikirim balik cuma graph terstruktur, bukan log traversal mentah</td></tr>
+      <tr><td>worktrees</td><td>node-agent</td><td>satu worktree per kanban card yang di-assign ke space itu — task paralel nggak tabrakan</td></tr>
+      <tr><td>luvus</td><td>VPS</td><td>kontrol pane, di-attach dari Mac/Windows/HP via Tailscale ssh</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Bikin cepat <span>checklist Tailscale</span></h2>
+    <div class="timeline">
+      <div class="tl-item"><time>1</time><p><code>tailscale ping &lt;mesin&gt;</code> — pastikan "direct", bukan "via DERP". Kalau relay, cek <code>tailscale netcheck</code> buat NAT type.</p></div>
+      <div class="tl-item"><time>2</time><p>Node-agent dial keluar ke VPS, bukan VPS masuk ke local — local machine biasanya di belakang NAT yang lebih ribet.</p></div>
+      <div class="tl-item"><time>3</time><p>MagicDNS aktif — alamat pakai nama mesin, bukan IP tailnet yang bisa berubah.</p></div>
+      <div class="tl-item"><time>4</time><p>gRPC plaintext di atas interface Tailscale — WireGuard udah encrypt, TLS tambahan cuma buang CPU/latency buat setup single-user.</p></div>
+      <div class="tl-item"><time>5</time><p>Auto-reconnect dengan backoff di node-agent; orchestrator tandai space offline &amp; switch ke SSH fallback kalau di atas threshold.</p></div>
+    </div>
+  </section>
+
+  <p class="note">File: <code>agentic-flow-adit.html</code> — serve di pane 13 <code>:7799</code> di VPS.
+    Akses lokal <code>http://localhost:7799/agentic-flow-adit.html</code> atau via Tailscale
+    <code>http://100.75.2.78:7799/agentic-flow-adit.html</code>.</p>
+
+  <footer>rev 3 — otak di VPS, tangan di node-agent (Mac/Windows), ssh fallback, no ollama, no opencode</footer>
+</div>
+<script>mermaid.initialize({startOnLoad:true, theme:'dark', themeVariables:{
+  darkMode:true, background:'#0a0a0a', primaryColor:'#141414', primaryTextColor:'#e8e6e1',
+  primaryBorderColor:'#3d5c56', lineColor:'#8a8a85', secondaryColor:'#1c1c1c', tertiaryColor:'#141414'
+}})</script>
+</body>
+</html>
