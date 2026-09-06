@@ -30,6 +30,9 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Write-Host "==> Menarik binary node-agent dari $Server (via tailscale)"
 $headers = @{ "X-Node-Agent-Token" = $Token }
 Invoke-WebRequest -Uri "$Server/dl/windows" -Headers $headers -OutFile "$ExePath.new" -UseBasicParsing
+# exe lock saat masih jalan — kill dulu, supervisor loop restart pakai binary baru
+Get-Process node-agent -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 1
 Move-Item -Force "$ExePath.new" $ExePath
 
 Write-Host "==> Menyimpan environment variable (persist antar sesi login)"
@@ -39,6 +42,7 @@ Write-Host "==> Menyimpan environment variable (persist antar sesi login)"
 
 Write-Host "==> Menulis supervisor script (auto-restart kalau exe crash — setara launchd KeepAlive)"
 @"
+`$env:HOME = `$env:USERPROFILE
 `$env:NODE_AGENT_SERVER = "$Server"
 `$env:NODE_AGENT_TOKEN  = "$Token"
 `$env:NODE_AGENT_ID     = "$NodeId"
