@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -235,9 +236,16 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	ctx, cancel := context.WithTimeout(context.Background(), jobTimeout())
 	defer cancel()
 
+	// Windows has no bash — WSL's bash lacks most coreutils and breaks
+	// chdir to Windows paths. Use cmd /c there, bash -lc elsewhere.
+	shell, shellFlag := "bash", "-lc"
+	if runtime.GOOS == "windows" {
+		shell, shellFlag = "cmd", "/c"
+	}
+
 	var cmd *exec.Cmd
 	if isShell {
-		cmd = exec.CommandContext(ctx, "bash", "-lc", job.Message)
+		cmd = exec.CommandContext(ctx, shell, shellFlag, job.Message)
 		cmd.Dir = ws
 	} else {
 		hermesBin := findBin("hermes")
@@ -250,7 +258,7 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 			cmd = exec.CommandContext(ctx, codexBin, "exec", "--full-auto", job.Message)
 			cmd.Dir = ws
 		} else {
-			cmd = exec.CommandContext(ctx, "bash", "-lc", job.Message)
+			cmd = exec.CommandContext(ctx, shell, shellFlag, job.Message)
 			cmd.Dir = ws
 		}
 	}

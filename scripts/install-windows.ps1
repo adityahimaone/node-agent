@@ -49,7 +49,7 @@ while (`$true) {
 "@ | Set-Content -Path $WrapperPath -Encoding UTF8
 
 Write-Host "==> Mendaftarkan Scheduled Task '$TaskName' (trigger: saat logon, restart on-crash via loop)"
-schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { schtasks /Delete /TN $TaskName /F | Out-Null }
 $action = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$WrapperPath`""
 schtasks /Create /TN $TaskName /TR $action /SC ONLOGON /RL HIGHEST /F | Out-Null
 
