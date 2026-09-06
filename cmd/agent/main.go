@@ -37,13 +37,23 @@ func main() {
 
 	go heartbeatLoop(server, nodeID)
 
-	// poll loop
+	// poll loop — re-register when the server lost our registration (restart).
 	client:=&http.Client{Timeout:30*time.Second}
+	register:=func() error {
+		return postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID:nodeID, Hostname:hostname(), Version:"0.1.0", Workspaces:loadWorkspaces()})
+	}
+	if err:=register(); err!=nil { log.Printf("register: %v (will retry on poll 404)", err) }
 	for {
 		req,_:=http.NewRequest("GET", server+"/api/nodes/"+nodeID+"/poll", nil)
 		resp, err:=client.Do(req)
 		if err!=nil { log.Printf("poll err: %v", err); time.Sleep(2*time.Second); continue }
 		if resp.StatusCode==204 { resp.Body.Close(); continue }
+		if resp.StatusCode==404 {
+			// server restarted / lost state — re-register then keep polling
+			resp.Body.Close()
+			if rerr:=register(); rerr!=nil { log.Printf("re-register: %v", rerr); time.Sleep(2*time.Second) }
+			continue
+		}
 		if resp.StatusCode!=200 { b:=readAll(resp); log.Printf("poll %d: %s", resp.StatusCode, string(b)); resp.Body.Close(); time.Sleep(2*time.Second); continue }
 		var job transport.DispatchRequest
 		if err:=json.NewDecoder(resp.Body).Decode(&job); err!=nil { log.Printf("decode: %v",err); resp.Body.Close(); continue }
