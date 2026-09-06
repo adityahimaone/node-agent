@@ -1,0 +1,5 @@
+node-agent-server
+node-agent
+/tmp/
+*.log
+.DS_Store
