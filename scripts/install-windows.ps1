@@ -1,4 +1,4 @@
-<#
+﻿<#
 Single-command installer/upgrader untuk node-agent di Windows.
 Usage (PowerShell biasa, bukan admin):
   $env:NODE_AGENT_TOKEN = "<token-yang-sama-dengan-VPS>"
