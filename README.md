@@ -1,287 +1,259 @@
-# node-agent — Otak di VPS, tangan di Mac/Windows lewat Tailscale
+# node-agent
 
-> agentic-flow-adit · rev 5
+Worker service untuk menjalankan task pada host yang memiliki source code. Server node-agent berjalan di VPS, sedangkan agent berjalan di Mac atau Windows. Agent membuka koneksi keluar ke VPS, sehingga VPS tidak perlu membuka koneksi masuk ke mesin lokal.
 
-Orchestrator, kanban, dan memory (Holographic) tinggal permanen di VPS. Eksekusi kode jalan
-di mesin lokal (Mac/Windows) lewat **node-agent** — koneksi persisten, bukan SSH tiap dispatch —
-dengan SSH sebagai fallback kalau stream putus. Ini realisasi dari konsep **Spaces** yang udah
-dirancang buat Hermes WebUI.
+Repository ini adalah execution plane. Kanban-board adalah control plane yang menyimpan task intent, memilih workspace dan executor, lalu mengirim dispatch ke server node-agent.
 
-## Kenapa node-agent, bukan SSH tiap task
+## Arsitektur
 
-| Aspek | SSH per-dispatch | Node-agent (dipilih) |
-|---|---|---|
-| Koneksi | ~~handshake + auth ulang tiap task~~ | satu koneksi persisten, reconnect otomatis kalau putus |
-| Arah koneksi | VPS → local (sering ke-block NAT/wifi kantor) | local dial keluar ke VPS (identitas tailnet stabil) |
-| Transport | shell exec, teks mentah | HTTP long-poll JSON (pola sama kayak transport Go↔Hermes yang udah jalan) |
-| Kalau koneksi mati | — | fallback otomatis ke SSH exec |
-| Auth | — | shared-secret token `X-Node-Agent-Token` di semua endpoint |
-
-## Alur — VPS (otak) ↔ node-agent (tangan)
-
-```mermaid
-flowchart LR
-  subgraph VPS["VPS · otak"]
-    O["orchestrator<br/>Hermes + Codex · 9router"]
-    K["kanban<br/>lane_by_space"]
-    M[("Holographic<br/>fact_store.db")]
-    S["node-agent server<br/>:8788 long-poll + auth"]
-  end
-  L["luvus pane<br/>hosted di VPS"]
-  T{{"Tailscale tailnet<br/>direct, no DERP"}}
-  NAmac["node-agent · Mac<br/>launchd KeepAlive<br/>hermes / codex / shell"]
-  NAwin["node-agent · Windows<br/>Scheduled Task + supervisor<br/>hermes / codex / shell"]
-
-  L --> O
-  O --> K
-  K -- dispatch --> S
-  S -- HTTP long-poll --> T
-  O -. call-graph RPC, on-demand .-> T
-  T --> NAmac
-  T --> NAwin
-  NAmac -- result --> S
-  NAwin -- result --> S
-  S -- result --> O
-  O --> M
-  M -. recall .-> O
-  T -. ssh fallback .-> NAmac
-  T -. ssh fallback .-> NAwin
+```text
+VPS
+  kanban-board -> node-agent server :8788
+                         ^
+                         | HTTP long-poll melalui Tailscale
+                         |
+Mac atau Windows
+  node-agent -> workspace lokal -> executor AI
+                                  Hermes | Codex | Command Code
+                              internal shell dispatch
 ```
 
-**Legend**
+Server menyimpan queue dan result in-memory. Agent melakukan register, heartbeat, long-poll, eksekusi satu job, lalu POST result kembali.
 
-| | |
-|---|---|
-| **O** | plans + delegates, nulis ke & recall dari memory |
-| **K** | assign task ke space (mac/windows) berdasarkan lane |
-| **S** | node-agent server — `POST /api/dispatch` route by workspace prefix, agent long-poll, token-auth |
-| **NA** | node-agent — eksekusi di workspace lokal, `runJob` heuristic: shell fast-path → hermes → codex |
-| **call-graph RPC** | orchestrator panggil langsung kapan aja — nggak nunggu kanban card |
-| **T** | tailnet — pastiin direct via `tailscale ping`, bukan relay DERP |
-| **M** | Holographic — fact_store.db, satu-satunya sumber konteks lintas mesin |
+## Executor
 
-## Security — auth token
+| Executor | Binary | Mode | Catatan |
+|---|---|---|---|
+| `hermes` | `hermes` | `hermes chat -q` | Memakai `HERMES_WORKSPACE` |
+| `codex` | `codex` | `codex exec --full-auto` | Task coding non-interaktif |
+| `commandcode` | `cmd`, `cmdc`, atau `command-code` | `-p ... --yolo` | `cmdc` adalah alias Windows |
+| `shell` | shell OS | `bash -lc` atau `cmd /c` | Internal orchestrator dispatch |
+| `auto` | capability yang tersedia | Hermes, lalu Codex, lalu Command Code | Untuk kompatibilitas |
 
-Semua endpoint `/api/*` dan `/dl/*` wajib header `X-Node-Agent-Token` (kecuali server
-dijalan tanpa token — itu di-log WARNING tiap start, jangan dibiasain).
+Agent tidak lagi menebak shell dari isi prompt. Dispatcher mengirim executor secara eksplisit. Field `command` hanya berlaku pada internal shell dispatch, bukan input task user.
 
-1. Generate sekali: `openssl rand -hex 32`
-2. Simpan di `~/.hermes/node-agent.env` (`NODE_AGENT_TOKEN=<hex>`, chmod 600) di **setiap mesin**
-   (VPS, Mac, Windows) — semua konsumen lokal (kanban-board, gateway watcher) baca dari file ini.
-3. Server & agent harus pakai nilai yang sama, kalau beda semua request `401 unauthorized`.
+### Command Code
 
-## Quick start
+Command Code didukung melalui headless CLI:
 
-VPS (server):
+```sh
+cmd -p "<prompt>" --yolo --skip-onboarding --output-format text
+```
+
+`--yolo` mengizinkan edit file dan shell command. Gunakan executor ini hanya pada node yang dipercaya. Command Code mendukung output JSON, tetapi node-agent saat ini meminta output text agar result task tetap mudah dibaca.
+
+Referensi: [headless mode](https://commandcode.ai/docs/headless) dan [CLI reference](https://commandcode.ai/docs/reference/cli).
+
+## Register dan capability
+
+Saat start, agent mencari binary yang tersedia dan mengirim daftar capability:
+
+```json
+{
+  "node_id":"mac",
+  "hostname":"aditya-mac",
+  "version":"0.3.0",
+  "workspaces":["/Users/aditya/Development"],
+  "executors":["hermes","codex","commandcode","shell"],
+  "versions":{"commandcode":"..."}
+}
+```
+
+Server hanya menerima executor eksplisit jika executor tersebut terdaftar pada node yang dipilih. Jika workspace tersedia di beberapa node, server memilih node yang memiliki capability tersebut.
+
+## Dispatch API
+
+Semua endpoint `/api/*` dan `/dl/*` menggunakan header `X-Node-Agent-Token` ketika server dan agent dikonfigurasi dengan token.
+
+### Kirim AI job
+
+```sh
+curl -X POST http://127.0.0.1:8788/api/dispatch \
+  -H 'Content-Type: application/json' \
+  -H "X-Node-Agent-Token: <token>" \
+  -d '{
+    "task_id":"t1",
+    "board":"saas",
+    "message":"Perbaiki validasi login",
+    "workspace":"/Users/aditya/Development/saas",
+    "executor":"commandcode"
+  }'
+```
+
+### Internal shell dispatch
+
+Orchestrator dapat mengirim command konkret setelah menentukan operasi yang harus dijalankan. Payload ini tidak berasal dari field command pada form task:
+
+```json
+{
+  "task_id":"t2",
+  "board":"saas",
+  "message":"generated by orchestrator",
+  "workspace":"/Users/aditya/Development/saas",
+  "executor":"shell",
+  "command":"git status && pnpm test"
+}
+```
+
+Ambil result:
+
+```sh
+curl -H "X-Node-Agent-Token: <token>" \
+  http://127.0.0.1:8788/api/results/t1
+```
+
+Result berisi `success`, `output`, `error`, dan `duration_ms`.
+
+### Endpoint
+
+| Method | Path | Kegunaan |
+|---|---|---|
+| GET | `/health` | Health dan daftar node |
+| GET | `/api/nodes` | Capability dan status node |
+| POST | `/api/nodes/register` | Register agent |
+| POST | `/api/nodes/{id}/heartbeat` | Update idle atau busy |
+| GET | `/api/nodes/{id}/poll` | Long-poll job |
+| POST | `/api/nodes/{id}/result` | Kirim hasil job |
+| POST | `/api/dispatch` | Queue job berdasarkan workspace |
+| GET | `/api/results/{task_id}` | Ambil hasil |
+| GET | `/api/workspaces` | Workspace server dan status node |
+| GET | `/dl/mac` | Download binary Mac |
+| GET | `/dl/windows` | Download binary Windows |
+
+## Context dan output optimization
+
+Sebelum executor AI dijalankan, agent menyiapkan context:
+
+1. `ensureCodegraph(ws)` memakai index yang ada atau menjalankan `codegraph init` dengan batas 60 detik.
+2. `PrequestNote` dari server diprioritaskan.
+3. Jika note kosong, agent membaca 100 baris pertama `AGENTS.md`, lalu `README.md`.
+4. Prompt akhir menggabungkan prerequisites, status codegraph, dan message task.
+
+Execution pipeline dirancang untuk mengurangi context yang dikirim ke model:
+
+- codegraph menyediakan index lokal agar agent tidak perlu membaca seluruh repository;
+- RTK mereduksi output command verbose sebelum masuk ke context;
+- caveman merangkum output job sebelum dikirim kembali ke orchestrator.
+
+Codegraph sudah menjadi preflight. RTK saat ini digunakan pada shell rewrite path. Adapter caveman masih perlu diaktifkan pada result pipeline agar rangkaian ini berlaku untuk semua executor.
+
+Kegagalan codegraph bersifat non-fatal. Job tetap dapat berjalan tanpa index.
+
+## Konfigurasi
+
+Environment server:
+
+```sh
+NODE_AGENT_ADDR=:8788
+NODE_AGENT_TOKEN=<shared-secret>
+NODE_AGENT_DIST_DIR=./dist
+```
+
+Environment agent:
+
+```sh
+NODE_AGENT_SERVER=http://100.64.0.1:8788
+NODE_AGENT_TOKEN=<shared-secret>
+NODE_AGENT_ID=mac
+NODE_AGENT_JOB_TIMEOUT=600
+NODE_AGENT_NO_RTK=1
+```
+
+`NODE_AGENT_NO_RTK=1` menonaktifkan rewrite `rtk` pada executor shell. Jika tidak diset, agent mencoba `rtk hook check` lalu `rtk rewrite`, masing-masing dengan batas 800 ms, dan memakai command asli jika rewrite gagal. RTK adalah binary dari proyek `rtk-ai/rtk`; nama executable-nya tetap `rtk`.
+
+Token harus sama pada server dan semua agent. Simpan token di `~/.hermes/node-agent.env` dengan mode file `0600`.
+
+## Instalasi server di VPS
 
 ```sh
 cd ~/apps/node-agent
 ./ctl.sh build
-NODE_AGENT_TOKEN=<token> ./ctl.sh start     # :8788, auth aktif
+NODE_AGENT_TOKEN=<token> ./ctl.sh start
 curl -H "X-Node-Agent-Token: <token>" http://127.0.0.1:8788/health
 ```
 
-`ctl.sh` juga serve binary agent: `./ctl.sh build-mac` / `./ctl.sh build-windows` output ke
-`dist/`, di-download agent via endpoint `/dl/mac` / `/dl/windows`.
+`ctl.sh` juga membangun binary silang dan menyajikannya melalui `/dl/mac` serta `/dl/windows`.
 
-### Mac (agent, launchd KeepAlive) — single command
+## Instalasi agent Mac
+
+Upgrade agent Mac boleh ditunda setelah server VPS dan kanban-board diperbarui. Binary
+lama tetap dapat terhubung, tetapi capability baru belum akan terdaftar sampai agent
+di-install ulang.
 
 ```sh
-# dari Mac (repo di-clone / script di-sync dulu):
 NODE_AGENT_TOKEN=<token-yang-sama-dengan-VPS> ./scripts/install-mac.sh
 ```
 
-Script narik binary dari VPS via `/dl/mac`, nulis plist `com.adit.node-agent`, load launchd,
-verifikasi registrasi. Upgrade = jalanin ulang script yang sama.
+Installer mengunduh binary, menulis LaunchAgent `com.adit.node-agent`, mengaktifkan KeepAlive, lalu memverifikasi register.
 
-Manual (lama, masih bisa):
-
-```sh
-GOOS=darwin GOARCH=arm64 go build -o node-agent ./cmd/agent
-scp node-agent <user>@100.64.0.2:.hermes/bin/node-agent
-ssh mac 'launchctl load ~/Library/LaunchAgents/com.adit.node-agent.plist'
-```
-
-### Windows (agent, Scheduled Task + supervisor) — single command
+## Instalasi agent Windows
 
 ```powershell
-# dari Windows (PowerShell biasa, bukan admin):
-cd C:\Users\<user>\apps\node-agent     # lokasi repo di-clone/sync
+cd C:\Users\<user>\apps\node-agent
 $env:NODE_AGENT_TOKEN = "<token-yang-sama-dengan-VPS>"
 .\scripts\install-windows.ps1
 ```
 
-Kalau ExecutionPolicy nge-block, jalanin sekali dulu:
-`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+Installer memakai Scheduled Task saat logon dan supervisor untuk restart ketika binary berhenti. Alias Command Code pada Windows adalah `cmdc`, karena `cmd` adalah command shell bawaan Windows.
 
-Script narik binary dari VPS via `/dl/windows` (kill exe jalan dulu biar file bisa di-swap),
-persist env `NODE_AGENT_SERVER/TOKEN/ID` di User env, nulis supervisor loop
-(`node-agent-supervisor.ps1` — restart exe dalam 3 detik kalau crash, setara `KeepAlive`),
-daftarin Scheduled Task `NodeAgent` trigger ONLOGON, jalanin, verifikasi registrasi.
+## Workspace routing
 
-Catatan Windows:
-- Agent baca `~/.hermes/workspaces.json` via `$HOME` — supervisor set `HOME=$env:USERPROFILE`
-  otomatis. Buat `workspaces.json` di `%USERPROFILE%\.hermes\` dgn isi workspace Windows, contoh:
+Server mencocokkan path task dengan prefix workspace yang dikirim agent saat register.
 
-  ```json
-  {"workspaces":[{"path":"C:\\Users\\<user>"}]}
-  ```
+- `/Users/...` biasanya menuju node Mac.
+- `C:\...` biasanya menuju node Windows.
+- Jika beberapa node memiliki workspace yang sama, capability executor ikut dipakai sebagai filter.
+- Jika workspace tidak cocok, server dapat memilih node online pertama untuk `auto`.
 
-- Shell fallback di Windows pakai `cmd /c` (bukan `bash -lc` — WSL bash gak punya coreutils
-  lengkap dan chdir ke path Windows)
-- `ONLOGON` butuh sesi user aktif; pre-login service (ONSTART + SYSTEM) di luar scope
-- Uninstall: `schtasks /Delete /TN NodeAgent /F`
-
-### Dispatch
-
-```sh
-curl -X POST http://127.0.0.1:8788/api/dispatch -H 'Content-Type: application/json' \
-  -H "X-Node-Agent-Token: <token>" \
-  -d '{"task_id":"t1","board":"f8-saas","message":"git status","workspace":"/Users/<user>/Development/saas"}'
-curl -H "X-Node-Agent-Token: <token>" http://127.0.0.1:8788/api/results/t1
-```
-
-Route by workspace prefix: workspace Mac (`/Users/...`) → node mac, workspace Windows
-(`C:\...`) → node windows. Gak match node manapun → fallback node pertama yang hidup.
-
-Verifikasi:
-
-```sh
-# tanpa token harus 401:
-curl -o /dev/null -w "%{http_code}\n" http://<vps-tailscale-ip>:8788/api/nodes
-# download binary agent:
-curl -H "X-Node-Agent-Token: <token>" -o node-agent http://<vps-tailscale-ip>:8788/dl/mac
-```
-
-## Workspaces
-
-`~/.hermes/workspaces.json` (VPS+Mac synced) binds hermes kanban boards to luvus workspaces:
-
-| id | path | apps |
-|---|---|---|
-| `root` | `/Users/<user>/Development` | — |
-| `saas` | `/Users/.../saas` | gadjian/app, portal-hadirr, baktiku-portal |
-| `bisadaya` | `/Users/.../bisadaya-monorepo` | remote `git@dev.fast-8.com:bisadaya/bisadaya-monorepo.git` |
-
-Helper `ws` CLI (`~/.hermes/bin/ws`):
-
-```sh
-ws list              # ID | STATUS connected/disconnected | ROUTE relay/direct | LUVUS | PATH
-ws ping [id]         # ssh probe per workspace
-ws open <id>         # luvus workspace open <path> on Mac + verify
-ws status --json     # machine-readable
-```
-
-## runJob heuristic (rev 5)
-
-Shell meta (`;`, `|`, `&&`) or CLI prefix (`git `, `ls `, `cat `, `echo `, `pwd`, `grep `, `find `…) →
-`bash -lc` (Mac) / `cmd /c` (Windows) fast (~50-100ms).
-Otherwise LLM prompt → `hermes chat -q` → `codex exec` fallback.
-
-Sebelum eksekusi prompt, agent membangun context:
-
-1. **`ensureCodegraph(ws)`** — `.codegraph/` ada → skip (codegraph auto-sync jalan sendiri);
-   binary `codegraph` ada → `codegraph init` (cap 60s, gagal = non-fatal, lanjut);
-   binary tidak ada → skip (tidak ada auto-install — install manual sekali:
-   `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh`).
-2. **`readPrequest(ws, note)`** — prequest project, prioritas:
-   (a) `PrequestNote` dari server (field `note` di `~/.hermes/workspaces.json`,
-   di-match longest-prefix terhadap workspace task) → (b) `AGENTS.md` head 100 baris
-   → (c) `README.md` head 100 baris.
-3. Prompt final = prequest + `[codegraph status]` + task message.
-
-Job timeout default **600s** (sebelumnya 120s — coding task multi-tool-call sering
-lebih lama; override `NODE_AGENT_JOB_TIMEOUT`, di-set 600 di launchd Mac).
-
-### Prequest note (workspaces.json)
+Workspace agent dibaca dari `~/.hermes/workspaces.json`:
 
 ```json
-{"workspaces":[{"id":"saas","path":"/Users/<user>/Development/saas","host":"mac-tailscale",
-  "note":"PHP legacy + jQuery. Entry cs.gadjian/www, controller di app/controller. Jangan commit langsung."}]}
+{"workspaces":[{"path":"/Users/aditya/Development"}]}
 ```
 
-Server (`cmd/server/main.go` `workspaceNoteFor`) meng-inject note ke
-`DispatchRequest.PrequestNote` sebelum job masuk queue agent — agent tidak perlu
-baca workspaces.json sendiri.
+## Timeout dan status
 
-### Review gate (kanban side)
+Default timeout job adalah 600 detik. Job yang melewati batas dibatalkan dan result dikirim sebagai gagal. Heartbeat memakai status `idle` atau `busy` agar server tidak mengirim pekerjaan baru ke agent yang sedang bekerja.
 
-Result sukses dari agent TIDAK langsung `done` — kanban-board memindahkan task ke
-`review`; approve (commit / commit&push) dijalankan kanban-board via SSH.
-Agent tidak pernah commit/push dari prompt dispatch. Detail: README kanban-board
-(`~/apps/kanban-board/README.md`) dan
-`docs/specs/2026-09-07-single-dispatcher-review-gate-design.md` di repo kanban-board.
-Job timeout default 120s (`NODE_AGENT_JOB_TIMEOUT` override, detik) — job hang gak
-wedge agent.
+Agent tidak melakukan commit atau push sebagai bagian dari dispatch kanban. Kanban mengambil diff dan menjalankan approval melalui review gate.
 
-| test | kind | duration |
-|---|---|---|
-| `echo;pwd;ls gadjian` | shell | 44ms |
-| `git branch --show-current` | shell | 90ms |
-| `list files in current directory` | hermes | 57.7s |
+## Build dan test
 
-## Install manifest
-
-```json
-{
-  "manifest": [
-    { "name": "hermes-agent",          "repo": "NousResearch/hermes-agent",        "role": "orchestrator",   "status": "installed" },
-    { "name": "holographic-memory",    "repo": "bysc1000/holographic-memory",      "role": "memory-plugin",  "status": "installed" },
-    { "name": "codex",                 "repo": "openai/codex",                     "role": "worker",         "status": "installed" },
-    { "name": "9router",               "repo": "decolua/9router",                  "role": "model-router",   "status": "installed" },
-    { "name": "luvus",                 "repo": "RizRiyz/luvus",                    "role": "multiplexer",    "status": "installed" },
-    { "name": "ponytail",              "repo": "DietrichGebert/ponytail",          "role": "skill",          "status": "installed" },
-    { "name": "caveman",               "repo": "JuliusBrussee/caveman",            "role": "skill",          "status": "installed" },
-    { "name": "call-graph",            "repo": "colbymchenry/codegraph",           "role": "skill",          "status": "installed" },
-    { "name": "worktrees",             "repo": "tanvesh01/issue-workflow",         "role": "skill",          "status": "skipped (repo empty)" },
-    { "name": "node-agent",            "repo": "adityahimaone/node-agent",         "role": "custom",         "status": "installed (this repo)" }
-  ]
-}
-```
-
-## Skills — siapa jalan di mana
-
-| Skill | Jalan di | Perannya |
-|---|---|---|
-| ponytail | node-agent, sebelum kirim hasil | saring dulu — kalau cukup `lru_cache`, jangan bikin kelas custom. Ngirit round-trip ke VPS |
-| caveman `full` | payload hasil | hasil node-agent → orchestrator terse. Ngurangin ukuran payload lewat tailnet, bukan cuma hemat context |
-| call-graph | node-agent (butuh akses codebase lokal) | `codegraph_explore` + LSP lokal, yang dikirim balik cuma graph terstruktur, bukan log traversal mentah |
-| worktrees | node-agent | satu worktree per kanban card yang di-assign ke space itu — task paralel nggak tabrakan |
-| luvus | VPS | kontrol pane, di-attach dari Mac/Windows/HP via Tailscale ssh |
-
-## Bikin cepat — checklist Tailscale
-
-1. `tailscale ping <mesin>` — pastikan "direct", bukan "via DERP". Kalau relay, cek `tailscale netcheck` buat NAT type.
-2. Node-agent dial keluar ke VPS, bukan VPS masuk ke local — local machine biasanya di belakang NAT yang lebih ribet.
-3. MagicDNS aktif — alamat pakai nama mesin, bukan IP tailnet yang bisa berubah.
-4. HTTP plaintext di atas interface Tailscale — WireGuard udah encrypt, TLS tambahan cuma buang CPU/latency buat setup single-user. Auth token nutup celah otorisasi.
-5. Auto-reconnect dengan backoff di node-agent; orchestrator tandai space offline & switch ke SSH fallback kalau di atas threshold.
-
-## Build
+Build server dan build agent adalah langkah terpisah. Build di VPS tidak mengubah
+binary agent yang sedang berjalan di Mac atau Windows.
 
 ```sh
-# VPS server
-go vet ./... && GOMAXPROCS=1 GOGC=20 go build -o node-agent-server ./cmd/server
+go test ./...
+go vet ./...
 
-# Mac agent (dari VPS, cross-compile) — output ke dist/, di-serve /dl/mac
-GOOS=darwin GOARCH=arm64 GOMAXPROCS=1 GOGC=20 go build -o dist/node-agent-darwin-arm64 ./cmd/agent
+go build -o node-agent-server ./cmd/server
 
-# Windows agent (dari VPS, cross-compile) — output ke dist/, di-serve /dl/windows
-GOOS=windows GOARCH=amd64 GOMAXPROCS=1 GOGC=20 go build -o dist/node-agent-windows-amd64.exe ./cmd/agent
+GOOS=darwin GOARCH=arm64 go build -o dist/node-agent-darwin-arm64 ./cmd/agent
+GOOS=windows GOARCH=amd64 go build -o dist/node-agent-windows-amd64.exe ./cmd/agent
 ```
 
-Stack: Go 1.23, chi, HTTP JSON long-poll (no protoc). Server di VPS (nohup via `ctl.sh`
-atau pm2 — token wajib masuk env), launchd di Mac, Scheduled Task di Windows, SSH alias
-`mac-tailscale` / `windows-tailscale` untuk file ops.
+## Troubleshooting
 
----
+### `401 unauthorized`
 
-rev 5 — prequest injection (workspaces.json note → DispatchRequest.PrequestNote),
-ensureCodegraph + readPrequest sebelum eksekusi, job timeout 120s→600s. Sukses → kolom
-review di kanban (approve commit/commit&push oleh kanban-board via SSH), agent tidak pernah
-commit sendiri.
+Pastikan `NODE_AGENT_TOKEN` sama pada server dan agent. Pastikan client mengirim header `X-Node-Agent-Token`.
 
-rev 4 — token auth semua endpoint, result TTL, /dl installer endpoints, Mac+Windows single-command
-installers, job timeout, honest heartbeat. Otak di VPS, tangan di node-agent (Mac/Windows),
-ssh fallback, no ollama, no opencode.
-Design spec: [docs/agentic-flow-adit.html](docs/agentic-flow-adit.html)
+### `executor unavailable on node`
+
+Jalankan binary executor pada host worker dan restart node-agent agar register capability diperbarui. Cek `/api/nodes`.
+
+### Node terdaftar tetapi workspace tidak dirutekan
+
+Pastikan path di `workspaces.json` adalah prefix dari path task. Perbedaan slash, drive letter, atau workspace parent yang salah dapat membuat route tidak cocok.
+
+### Command Code gagal start
+
+Linux dan macOS membutuhkan `cmd` atau `command-code`. Windows membutuhkan `cmdc` atau `command-code`. Jalankan `cmd --version`, `cmdc --version`, atau `command-code --version` secara lokal pada user yang menjalankan service.
+
+## Repository terkait
+
+- [kanban-board](https://github.com/adityahimaone/kanban-board): board, dispatcher, review gate.
+- [Command Code CLI reference](https://commandcode.ai/docs/reference/cli).
+- [Command Code headless mode](https://commandcode.ai/docs/headless).
+- [RTK](https://github.com/rtk-ai/rtk): command output reduction.
+- [Caveman](https://github.com/JuliusBrussee/caveman): result compression target.
