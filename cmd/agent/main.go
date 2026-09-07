@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"sync/atomic"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"node-agent/internal/transport"
@@ -254,7 +254,7 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 
 	var cmd *exec.Cmd
 	if isShell {
-		cmd = exec.CommandContext(ctx, shell, shellFlag, job.Message)
+		cmd = exec.CommandContext(ctx, shell, shellFlag, rewriteShellCmd(job.Message))
 		cmd.Dir = ws
 	} else {
 		hermesBin := findBin("hermes")
@@ -327,6 +327,43 @@ func readPrequest(ws, note string) string {
 		return fmt.Sprintf("Project prerequisites (%s head):\n%s", name, strings.Join(lines, "\n"))
 	}
 	return ""
+}
+
+// rewriteShellCmd tries rtk rewrite via `rtk hook check` then `rtk rewrite`.
+// Single source of truth for hermes/Claude hooks. If rtk knows a compact
+// form, return rewritten; otherwise raw. 800ms cap so broken rtk never stalls.
+// ponytail: `rtk rewrite` exit code is unstable across versions (observed 3
+// with valid output); rely on non-empty output not starting with "No rewrite".
+func rewriteShellCmd(raw string) string {
+	if os.Getenv("NODE_AGENT_NO_RTK") == "1" {
+		return raw
+	}
+	bin := findBin("rtk")
+	if bin == "" {
+		if p, err := exec.LookPath("rtk"); err == nil {
+			bin = p
+		} else {
+			return raw
+		}
+	}
+	try := func(args ...string) (string, bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, args...)
+		out, _ := cmd.CombinedOutput()
+		s := strings.TrimSpace(string(out))
+		if s == "" || strings.HasPrefix(s, "No rewrite for:") {
+			return "", false
+		}
+		return s, true
+	}
+	if s, ok := try("hook", "check", raw); ok {
+		return s
+	}
+	if s, ok := try("rewrite", raw); ok {
+		return s
+	}
+	return raw
 }
 
 func findBin(name string) string {
