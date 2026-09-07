@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"google.golang.org/grpc"
 	"node-agent/internal/heartbeat"
 	"node-agent/internal/transport"
 )
@@ -80,7 +83,6 @@ func cleanupResults() {
 	}
 }
 
-
 // workspaceNoteFor looks up the Note field of the workspace (in
 // $HOME/.hermes/workspaces.json) that is the longest prefix of wsPath.
 // Empty string when none matches.
@@ -126,6 +128,28 @@ func main() {
 	if distDir == "" {
 		distDir = "./dist"
 	}
+	currentAuthToken = authToken
+
+	// gRPC listener (worker lane). Disabled by setting NODE_AGENT_GRPC_ENABLED=0.
+	grpcAddr := os.Getenv("NODE_AGENT_GRPC_ADDR")
+	if grpcAddr == "" {
+		grpcAddr = ":8789"
+	}
+	if os.Getenv("NODE_AGENT_GRPC_ENABLED") != "0" {
+		go func() {
+			gs := grpc.NewServer(grpc.ForceServerCodec(transport.Codec{}))
+			transport.RegisterNodeAgentServiceServer(gs, grpcService{})
+			lis, err := net.Listen("tcp", grpcAddr)
+			if err != nil {
+				log.Printf("grpc listen %s failed: %v (HTTP long-poll remains the worker lane)", grpcAddr, err)
+				return
+			}
+			log.Printf("node-agent gRPC listening on %s", grpcAddr)
+			if err := gs.Serve(lis); err != nil {
+				log.Printf("grpc serve: %v", err)
+			}
+		}()
+	}
 
 	go cleanupResults()
 
@@ -144,7 +168,7 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		reg.Upsert(&heartbeat.Node{NodeID: req.NodeID, Hostname: req.Hostname, Workspaces: req.Workspaces, Status: "idle"})
+		reg.Upsert(&heartbeat.Node{NodeID: req.NodeID, Hostname: req.Hostname, Workspaces: req.Workspaces, Executors: req.Executors, Versions: req.Versions, Status: "idle"})
 		qmu.Lock()
 		if _, ok := queues[req.NodeID]; !ok {
 			queues[req.NodeID] = make(chan transport.DispatchRequest, 16)
@@ -230,17 +254,51 @@ func main() {
 			http.Error(w, "no nodes available", 503)
 			return
 		}
+		executor := strings.ToLower(strings.TrimSpace(req.Executor))
+		if executor == "" {
+			executor = "auto"
+		}
+		if executor != "auto" {
+			n, _ := reg.Get(nodeID)
+			available := nodeSupports(n, executor)
+			if !available {
+				// A workspace can be registered on more than one node. Prefer a
+				// matching node that actually has the requested executor.
+				for _, candidate := range reg.List() {
+					if candidate.Status == "offline" || !nodeSupports(candidate, executor) {
+						continue
+					}
+					for _, ws := range candidate.Workspaces {
+						if req.Workspace == ws || (len(req.Workspace) > len(ws) && strings.HasPrefix(req.Workspace, ws)) {
+							nodeID, available = candidate.NodeID, true
+							break
+						}
+					}
+					if available {
+						break
+					}
+				}
+			}
+			if !available {
+				http.Error(w, "executor unavailable on node: "+executor, 409)
+				return
+			}
+		}
 		// Inject PrequestNote: match req.Workspace against workspaces.json
 		// paths (longest prefix) and copy that workspace's Note, so the
 		// agent gets project prerequisites without reading it itself.
 		if req.PrequestNote == "" && req.Workspace != "" {
 			req.PrequestNote = workspaceNoteFor(req.Workspace)
 		}
+		if deliveryID, ok := dispatchGRPC(req, nodeID); ok {
+			transport.WriteJSON(w, 200, map[string]any{"status": "queued", "node_id": nodeID, "transport": "grpc", "delivery_id": deliveryID})
+			return
+		}
 		ch := getQueue(nodeID)
 		select {
 		case ch <- req:
-			log.Printf("dispatch %s -> %s ws=%s", req.TaskID, nodeID, req.Workspace)
-			transport.WriteJSON(w, 200, map[string]any{"status": "queued", "node_id": nodeID})
+			log.Printf("dispatch %s -> %s ws=%s transport=http", req.TaskID, nodeID, req.Workspace)
+			transport.WriteJSON(w, 200, map[string]any{"status": "queued", "node_id": nodeID, "transport": "http"})
 		default:
 			http.Error(w, "node queue full", 503)
 		}
@@ -296,4 +354,16 @@ func main() {
 	if err := http.ListenAndServe(addr, r); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func nodeSupports(n *heartbeat.Node, executor string) bool {
+	if n == nil {
+		return false
+	}
+	for _, e := range n.Executors {
+		if e == executor {
+			return true
+		}
+	}
+	return false
 }

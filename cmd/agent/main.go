@@ -7,6 +7,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,14 +69,29 @@ func main() {
 	fmt.Printf("node-agent %s -> %s\n", nodeID, server)
 
 	wsPaths := loadWorkspaces()
+	executors, versions := detectExecutors()
 
 	register := func() error {
-		return postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID: nodeID, Hostname: hostname(), Version: "0.2.0", Workspaces: loadWorkspaces()})
+		return postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: loadWorkspaces(), Executors: executors, Versions: versions})
 	}
-	if err := postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID: nodeID, Hostname: hostname(), Version: "0.2.0", Workspaces: wsPaths}); err != nil {
+	transportMode := strings.ToLower(strings.TrimSpace(os.Getenv("NODE_AGENT_TRANSPORT")))
+	if transportMode == "" {
+		transportMode = "auto"
+	}
+	grpcTarget := os.Getenv("NODE_AGENT_GRPC_TARGET")
+	if transportMode == "grpc" || (transportMode == "auto" && grpcTarget != "") {
+		if err := runGRPC(server, grpcTarget, nodeID, wsPaths, executors, versions); err == nil {
+			return
+		} else if transportMode == "grpc" {
+			log.Fatalf("grpc transport: %v", err)
+		} else {
+			log.Printf("grpc unavailable, falling back to HTTP: %v", err)
+		}
+	}
+	if err := postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: wsPaths, Executors: executors, Versions: versions, Transports: []string{"http"}}); err != nil {
 		log.Fatalf("register: %v", err)
 	}
-	log.Printf("registered %s workspaces=%v", nodeID, wsPaths)
+	log.Printf("registered %s transport=http workspaces=%v", nodeID, wsPaths)
 
 	go heartbeatLoop(server, nodeID)
 
@@ -142,6 +162,58 @@ func heartbeatLoop(server, nodeID string) {
 }
 
 func contains(s, sub string) bool { return bytes.Contains([]byte(s), []byte(sub)) }
+
+func runGRPC(server, target, nodeID string, wsPaths, executors []string, versions map[string]string) error {
+	if target == "" {
+		return fmt.Errorf("NODE_AGENT_GRPC_TARGET is empty")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.ForceCodec(transport.Codec{})))
+	if err != nil {
+		return fmt.Errorf("grpc connect: %w", err)
+	}
+	defer conn.Close()
+	streamCtx := context.Background()
+	if agentToken != "" {
+		streamCtx = metadata.NewOutgoingContext(streamCtx, metadata.Pairs("x-node-agent-token", agentToken))
+	}
+	stream, err := transport.NewNodeAgentServiceClient(conn).Connect(streamCtx)
+	if err != nil {
+		return fmt.Errorf("grpc stream: %w", err)
+	}
+	if err := stream.Send(&transport.WorkerFrame{Register: &transport.RegisterFrame{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: wsPaths, Executors: executors, Versions: versions, Transports: []string{"grpc", "http"}}}); err != nil {
+		return fmt.Errorf("grpc register: %w", err)
+	}
+	ack, err := stream.Recv()
+	if err != nil || ack.RegisterAck == nil {
+		return fmt.Errorf("grpc register ack: %w", err)
+	}
+	log.Printf("registered %s transport=grpc session=%s target=%s (http fallback=%s)", nodeID, ack.RegisterAck.SessionID, target, server)
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			return fmt.Errorf("grpc receive: %w", err)
+		}
+		if frame.DispatchJob == nil {
+			continue
+		}
+		job := frame.DispatchJob
+		atomic.StoreInt32(&busy, 1)
+		_ = stream.Send(&transport.WorkerFrame{Heartbeat: &transport.HeartbeatFrame{NodeID: nodeID, Status: "busy"}})
+		if err := stream.Send(&transport.WorkerFrame{JobAck: &transport.JobAck{DeliveryID: job.DeliveryID, Accepted: true}}); err != nil {
+			return err
+		}
+		start := time.Now()
+		output, ok, errStr := runJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, PrequestNote: job.PrequestNote})
+		dur := time.Since(start).Milliseconds()
+		atomic.StoreInt32(&busy, 0)
+		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: dur}}); err != nil {
+			return err
+		}
+		_ = stream.Send(&transport.WorkerFrame{Heartbeat: &transport.HeartbeatFrame{NodeID: nodeID, Status: "idle"}})
+	}
+}
 func hostname() string {
 	h, _ := os.Hostname()
 	if h == "" {
@@ -231,17 +303,6 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
 	}
 
-	// Heuristic: shell meta or common CLI prefix → run shell directly (no LLM).
-	// Otherwise treat as hermes/codex task prompt.
-	shellPrefixes := []string{"git ", "ls ", "cat ", "echo ", "pwd", "cd ", "grep ", "find ", "head ", "tail ", "curl ", "node ", "npm ", "pnpm ", "python "}
-	isShell := bytes.Contains([]byte(job.Message), []byte(";")) || bytes.Contains([]byte(job.Message), []byte("&&")) || bytes.Contains([]byte(job.Message), []byte("|"))
-	for _, p := range shellPrefixes {
-		if bytes.HasPrefix([]byte(job.Message), []byte(p)) {
-			isShell = true
-			break
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), jobTimeout())
 	defer cancel()
 
@@ -252,25 +313,56 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		shell, shellFlag = "cmd", "/c"
 	}
 
-	var cmd *exec.Cmd
-	if isShell {
-		cmd = exec.CommandContext(ctx, shell, shellFlag, rewriteShellCmd(job.Message))
-		cmd.Dir = ws
-	} else {
-		hermesBin := findBin("hermes")
-		codexBin := findBin("codex")
-		if hermesBin != "" {
-			cmd = exec.CommandContext(ctx, hermesBin, "chat", "-q", prompt)
-			cmd.Dir = ws
-			cmd.Env = append(os.Environ(), "HERMES_WORKSPACE="+ws)
-		} else if codexBin != "" {
-			cmd = exec.CommandContext(ctx, codexBin, "exec", "--full-auto", prompt)
-			cmd.Dir = ws
-		} else {
-			cmd = exec.CommandContext(ctx, shell, shellFlag, job.Message)
-			cmd.Dir = ws
-		}
+	executor := strings.ToLower(strings.TrimSpace(job.Executor))
+	if executor == "" {
+		executor = "auto"
 	}
+	var cmd *exec.Cmd
+	switch executor {
+	case "shell":
+		command := job.Command
+		if strings.TrimSpace(command) == "" {
+			return "", false, "shell executor requires command"
+		}
+		cmd = exec.CommandContext(ctx, shell, shellFlag, rewriteShellCmd(command))
+	case "hermes":
+		bin := findBin("hermes")
+		if bin == "" {
+			return "", false, "executor_unavailable: hermes"
+		}
+		cmd = exec.CommandContext(ctx, bin, "chat", "-q", prompt)
+		cmd.Env = append(os.Environ(), "HERMES_WORKSPACE="+ws)
+	case "codex":
+		bin := findBin("codex")
+		if bin == "" {
+			return "", false, "executor_unavailable: codex"
+		}
+		cmd = exec.CommandContext(ctx, bin, "exec", "--full-auto", prompt)
+	case "commandcode":
+		bin := commandCodeBin()
+		if bin == "" {
+			return "", false, "executor_unavailable: commandcode (cmd/cmdc)"
+		}
+		cmd = exec.CommandContext(ctx, bin, "-p", prompt, "--yolo", "--skip-onboarding", "--output-format", "text")
+	case "auto":
+		// Auto preserves the historical preference but remains explicit in the result.
+		if findBin("hermes") != "" {
+			job.Executor = "hermes"
+			return runJob(job)
+		}
+		if findBin("codex") != "" {
+			job.Executor = "codex"
+			return runJob(job)
+		}
+		if commandCodeBin() != "" {
+			job.Executor = "commandcode"
+			return runJob(job)
+		}
+		return "", false, "executor_unavailable: auto found no AI executor"
+	default:
+		return "", false, fmt.Sprintf("unknown executor %q", executor)
+	}
+	cmd.Dir = ws
 	out, err := cmd.CombinedOutput()
 	_ = os.WriteFile(logFile, out, 0644)
 	if ctx.Err() == context.DeadlineExceeded {
@@ -280,6 +372,45 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		return string(out), false, err.Error()
 	}
 	return string(out), true, ""
+}
+
+func commandCodeBin() string {
+	if runtime.GOOS == "windows" {
+		return findBinAny("cmdc", "command-code")
+	}
+	return findBinAny("cmd", "command-code")
+}
+
+func findBinAny(names ...string) string {
+	for _, name := range names {
+		if p := findBin(name); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+func detectExecutors() ([]string, map[string]string) {
+	checks := []struct {
+		name string
+		bins []string
+	}{
+		{"hermes", []string{"hermes"}}, {"codex", []string{"codex"}},
+		{"commandcode", []string{"cmd", "cmdc", "command-code"}},
+	}
+	var out []string
+	versions := map[string]string{}
+	for _, c := range checks {
+		if bin := findBinAny(c.bins...); bin != "" {
+			out = append(out, c.name)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			b, _ := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+			cancel()
+			versions[c.name] = strings.TrimSpace(string(b))
+		}
+	}
+	out = append(out, "shell")
+	return out, versions
 }
 
 // ensureCodegraph makes sure the workspace has a codegraph index. Non-fatal:

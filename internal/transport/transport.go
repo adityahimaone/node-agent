@@ -10,10 +10,13 @@ import (
 
 // Register — agent dials in.
 type RegisterRequest struct {
-	NodeID   string `json:"node_id"`   // "mac" / "windows"
-	Hostname string `json:"hostname"`
-	Version  string `json:"version"`
-	Workspaces []string `json:"workspaces"` // paths from ~/.hermes/workspaces.json
+	NodeID     string            `json:"node_id"` // "mac" / "windows"
+	Hostname   string            `json:"hostname"`
+	Version    string            `json:"version"`
+	Workspaces []string          `json:"workspaces"`          // paths from ~/.hermes/workspaces.json
+	Executors  []string          `json:"executors,omitempty"` // installed runners on this node
+	Versions   map[string]string `json:"versions,omitempty"`
+	Transports []string          `json:"transports,omitempty"`
 }
 
 // Heartbeat
@@ -30,6 +33,8 @@ type DispatchRequest struct {
 	Workspace string `json:"workspace"` // absolute path on agent
 	Model     string `json:"model"`
 	Provider  string `json:"provider"`
+	Executor  string `json:"executor,omitempty"` // auto|hermes|codex|commandcode|shell
+	Command   string `json:"command,omitempty"`  // only used by shell executor
 	// PrequestNote is the workspace prequest (project prerequisites) injected
 	// by the server from workspaces.json Note — prepended to the agent prompt.
 	PrequestNote string `json:"prequest_note,omitempty"`
@@ -37,19 +42,20 @@ type DispatchRequest struct {
 
 // Result — agent -> server
 type ResultRequest struct {
-	TaskID  string `json:"task_id"`
-	Success bool   `json:"success"`
-	Output  string `json:"output"`
-	Error   string `json:"error,omitempty"`
-	DurationMs int64 `json:"duration_ms"`
+	TaskID     string `json:"task_id"`
+	Success    bool   `json:"success"`
+	Output     string `json:"output"`
+	Error      string `json:"error,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 func WriteJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type","application/json")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 func ReadJSON(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
+
 var _ = time.Now
