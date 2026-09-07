@@ -1,6 +1,6 @@
 # node-agent — Otak di VPS, tangan di Mac/Windows lewat Tailscale
 
-> agentic-flow-adit · rev 4
+> agentic-flow-adit · rev 5
 
 Orchestrator, kanban, dan memory (Holographic) tinggal permanen di VPS. Eksekusi kode jalan
 di mesin lokal (Mac/Windows) lewat **node-agent** — koneksi persisten, bukan SSH tiap dispatch —
@@ -172,11 +172,45 @@ ws open <id>         # luvus workspace open <path> on Mac + verify
 ws status --json     # machine-readable
 ```
 
-## runJob heuristic
+## runJob heuristic (rev 5)
 
 Shell meta (`;`, `|`, `&&`) or CLI prefix (`git `, `ls `, `cat `, `echo `, `pwd`, `grep `, `find `…) →
 `bash -lc` (Mac) / `cmd /c` (Windows) fast (~50-100ms).
-Otherwise task prompt → `hermes chat -q` (~25-60s) → `codex exec` fallback.
+Otherwise LLM prompt → `hermes chat -q` → `codex exec` fallback.
+
+Sebelum eksekusi prompt, agent membangun context:
+
+1. **`ensureCodegraph(ws)`** — `.codegraph/` ada → skip (codegraph auto-sync jalan sendiri);
+   binary `codegraph` ada → `codegraph init` (cap 60s, gagal = non-fatal, lanjut);
+   binary tidak ada → skip (tidak ada auto-install — install manual sekali:
+   `curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh`).
+2. **`readPrequest(ws, note)`** — prequest project, prioritas:
+   (a) `PrequestNote` dari server (field `note` di `~/.hermes/workspaces.json`,
+   di-match longest-prefix terhadap workspace task) → (b) `AGENTS.md` head 100 baris
+   → (c) `README.md` head 100 baris.
+3. Prompt final = prequest + `[codegraph status]` + task message.
+
+Job timeout default **600s** (sebelumnya 120s — coding task multi-tool-call sering
+lebih lama; override `NODE_AGENT_JOB_TIMEOUT`, di-set 600 di launchd Mac).
+
+### Prequest note (workspaces.json)
+
+```json
+{"workspaces":[{"id":"saas","path":"/Users/<user>/Development/saas","host":"mac-tailscale",
+  "note":"PHP legacy + jQuery. Entry cs.gadjian/www, controller di app/controller. Jangan commit langsung."}]}
+```
+
+Server (`cmd/server/main.go` `workspaceNoteFor`) meng-inject note ke
+`DispatchRequest.PrequestNote` sebelum job masuk queue agent — agent tidak perlu
+baca workspaces.json sendiri.
+
+### Review gate (kanban side)
+
+Result sukses dari agent TIDAK langsung `done` — kanban-board memindahkan task ke
+`review`; approve (commit / commit&push) dijalankan kanban-board via SSH.
+Agent tidak pernah commit/push dari prompt dispatch. Detail: README kanban-board
+(`~/apps/kanban-board/README.md`) dan
+`docs/specs/2026-09-07-single-dispatcher-review-gate-design.md` di repo kanban-board.
 Job timeout default 120s (`NODE_AGENT_JOB_TIMEOUT` override, detik) — job hang gak
 wedge agent.
 
@@ -241,6 +275,11 @@ atau pm2 — token wajib masuk env), launchd di Mac, Scheduled Task di Windows, 
 `mac-tailscale` / `windows-tailscale` untuk file ops.
 
 ---
+
+rev 5 — prequest injection (workspaces.json note → DispatchRequest.PrequestNote),
+ensureCodegraph + readPrequest sebelum eksekusi, job timeout 120s→600s. Sukses → kolom
+review di kanban (approve commit/commit&push oleh kanban-board via SSH), agent tidak pernah
+commit sendiri.
 
 rev 4 — token auth semua endpoint, result TTL, /dl installer endpoints, Mac+Windows single-command
 installers, job timeout, honest heartbeat. Otak di VPS, tangan di node-agent (Mac/Windows),

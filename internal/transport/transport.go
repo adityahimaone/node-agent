@@ -30,6 +30,9 @@ type DispatchRequest struct {
 	Workspace string `json:"workspace"` // absolute path on agent
 	Model     string `json:"model"`
 	Provider  string `json:"provider"`
+	// PrequestNote is the workspace prequest (project prerequisites) injected
+	// by the server from workspaces.json Note — prepended to the agent prompt.
+	PrequestNote string `json:"prequest_note,omitempty"`
 }
 
 // Result — agent -> server

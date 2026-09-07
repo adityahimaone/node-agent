@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync/atomic"
+	"strings"
 	"time"
 
 	"node-agent/internal/transport"
@@ -201,7 +202,7 @@ func bytesReadAll(r *http.Response) ([]byte, error) {
 // heartbeat status change) with no way to recover except killing the process
 // by hand. Override with NODE_AGENT_JOB_TIMEOUT (seconds).
 func jobTimeout() time.Duration {
-	secs := 120
+	secs := 600
 	if v := os.Getenv("NODE_AGENT_JOB_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			secs = n
@@ -221,6 +222,14 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	tmpDir := filepath.Join(os.TempDir(), "node-agent-"+job.TaskID)
 	_ = os.MkdirAll(tmpDir, 0755)
 	logFile := filepath.Join(tmpDir, "run.log")
+
+	// Context build: codegraph ensure + project prerequisites, then prompt.
+	cgStatus := ensureCodegraph(ws)
+	prequest := readPrequest(ws, job.PrequestNote)
+	prompt := job.Message
+	if prequest != "" || cgStatus != "" {
+		prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
+	}
 
 	// Heuristic: shell meta or common CLI prefix → run shell directly (no LLM).
 	// Otherwise treat as hermes/codex task prompt.
@@ -251,11 +260,11 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		hermesBin := findBin("hermes")
 		codexBin := findBin("codex")
 		if hermesBin != "" {
-			cmd = exec.CommandContext(ctx, hermesBin, "chat", "-q", job.Message)
+			cmd = exec.CommandContext(ctx, hermesBin, "chat", "-q", prompt)
 			cmd.Dir = ws
 			cmd.Env = append(os.Environ(), "HERMES_WORKSPACE="+ws)
 		} else if codexBin != "" {
-			cmd = exec.CommandContext(ctx, codexBin, "exec", "--full-auto", job.Message)
+			cmd = exec.CommandContext(ctx, codexBin, "exec", "--full-auto", prompt)
 			cmd.Dir = ws
 		} else {
 			cmd = exec.CommandContext(ctx, shell, shellFlag, job.Message)
@@ -272,6 +281,54 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	}
 	return string(out), true, ""
 }
+
+// ensureCodegraph makes sure the workspace has a codegraph index. Non-fatal:
+// any failure just means the agent works without graph context.
+// - .codegraph/ exists  -> skip (codegraph auto-syncs from here)
+// - binary exists       -> codegraph init (60s cap)
+// - no binary           -> skip (no auto-install; install manually once)
+func ensureCodegraph(ws string) string {
+	if _, err := os.Stat(filepath.Join(ws, ".codegraph")); err == nil {
+		return "codegraph: index exists (auto-sync active)"
+	}
+	bin := findBin("codegraph")
+	if bin == "" {
+		return "codegraph: not installed, skipped (fallback: FILE_INDEX/AGENTS.md)"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "init")
+	cmd.Dir = ws
+	_, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "codegraph init: timed out after 60s (continuing without)"
+	}
+	if err != nil {
+		return fmt.Sprintf("codegraph init failed (continuing): %v", err)
+	}
+	return "codegraph init: ok"
+}
+
+// readPrequest returns the project prerequisites text: the server-injected
+// Note from workspaces.json wins, else AGENTS.md head, else README.md head.
+func readPrequest(ws, note string) string {
+	if note != "" {
+		return "Project prerequisites (workspaces note):\n" + note
+	}
+	for _, name := range []string{"AGENTS.md", "README.md"} {
+		b, err := os.ReadFile(filepath.Join(ws, name))
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(b), "\n")
+		if len(lines) > 100 {
+			lines = lines[:100]
+		}
+		return fmt.Sprintf("Project prerequisites (%s head):\n%s", name, strings.Join(lines, "\n"))
+	}
+	return ""
+}
+
 func findBin(name string) string {
 	for _, p := range []string{os.ExpandEnv("$HOME/.local/bin/" + name), "/opt/homebrew/bin/" + name, "/usr/local/bin/" + name} {
 		if _, err := os.Stat(p); err == nil {

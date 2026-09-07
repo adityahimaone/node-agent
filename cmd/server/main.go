@@ -80,6 +80,38 @@ func cleanupResults() {
 	}
 }
 
+
+// workspaceNoteFor looks up the Note field of the workspace (in
+// $HOME/.hermes/workspaces.json) that is the longest prefix of wsPath.
+// Empty string when none matches.
+func workspaceNoteFor(wsPath string) string {
+	raw, err := os.ReadFile(os.ExpandEnv("$HOME/.hermes/workspaces.json"))
+	if err != nil {
+		return ""
+	}
+	var data struct {
+		Workspaces []struct {
+			Path string `json:"path"`
+			Note string `json:"note"`
+		} `json:"workspaces"`
+	}
+	if json.Unmarshal(raw, &data) != nil {
+		return ""
+	}
+	best, note := "", ""
+	for _, w := range data.Workspaces {
+		if w.Note == "" || w.Path == "" {
+			continue
+		}
+		if wsPath == w.Path || (len(wsPath) > len(w.Path) && wsPath[:len(w.Path)] == w.Path) {
+			if len(w.Path) > len(best) {
+				best, note = w.Path, w.Note
+			}
+		}
+	}
+	return note
+}
+
 func main() {
 	addr := os.Getenv("NODE_AGENT_ADDR")
 	if addr == "" {
@@ -197,6 +229,12 @@ func main() {
 		if nodeID == "" {
 			http.Error(w, "no nodes available", 503)
 			return
+		}
+		// Inject PrequestNote: match req.Workspace against workspaces.json
+		// paths (longest prefix) and copy that workspace's Note, so the
+		// agent gets project prerequisites without reading it itself.
+		if req.PrequestNote == "" && req.Workspace != "" {
+			req.PrequestNote = workspaceNoteFor(req.Workspace)
 		}
 		ch := getQueue(nodeID)
 		select {
