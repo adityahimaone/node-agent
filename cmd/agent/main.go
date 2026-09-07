@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -182,9 +183,29 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 	if err != nil {
 		return fmt.Errorf("grpc stream: %w", err)
 	}
-	if err := stream.Send(&transport.WorkerFrame{Register: &transport.RegisterFrame{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: wsPaths, Executors: executors, Versions: versions, Transports: []string{"grpc", "http"}}}); err != nil {
+	var sendMu sync.Mutex
+	send := func(frame *transport.WorkerFrame) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(frame)
+	}
+	if err := send(&transport.WorkerFrame{Register: &transport.RegisterFrame{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: wsPaths, Executors: executors, Versions: versions, Transports: []string{"grpc", "http"}}}); err != nil {
 		return fmt.Errorf("grpc register: %w", err)
 	}
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := send(&transport.WorkerFrame{Heartbeat: &transport.HeartbeatFrame{NodeID: nodeID, Status: func() string {
+				if atomic.LoadInt32(&busy) == 1 {
+					return "busy"
+				}
+				return "idle"
+			}()}}); err != nil {
+				return
+			}
+		}
+	}()
 	ack, err := stream.Recv()
 	if err != nil || ack.RegisterAck == nil {
 		return fmt.Errorf("grpc register ack: %w", err)
