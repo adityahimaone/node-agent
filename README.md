@@ -1,146 +1,163 @@
 # node-agent
 
-Worker service untuk menjalankan task pada host yang memiliki source code. Server node-agent berjalan di VPS, sedangkan agent berjalan di Mac atau Windows. Agent membuka koneksi keluar ke VPS, sehingga VPS tidak perlu membuka koneksi masuk ke mesin lokal.
+Worker service for running tasks on hosts that own the source code. The node-agent server runs on the VPS. Agents run on Mac or Windows. Agents open outbound connections to the VPS, so the VPS does not need inbound access to local machines.
 
-Repository ini adalah execution plane. Kanban-board adalah control plane yang menyimpan task intent, memilih workspace dan executor, lalu mengirim dispatch ke server node-agent.
+This repository is the execution plane. [Switchyard](https://github.com/adityahimaone/switchyard) is the control plane: it stores task intent, selects a workspace and executor, then dispatches work to this service.
 
-## Arsitektur
+## Architecture
 
 ```mermaid
 flowchart LR
-  C[Control plane<br/>kanban-board] --> S[Node-agent server<br/>:8788]
-  S -->|HTTP long-poll| T[Tailscale]
+  C[Control plane<br/>Switchyard] --> S[Node-agent server<br/>:8788 HTTP + :8789 gRPC]
+  S -->|gRPC preferred<br/>HTTP fallback| T[Tailscale]
   T --> M[Mac agent]
   T --> W[Windows agent]
   M --> X[Workspace + executor]
   W --> X
   X --> S
+  S --> C
 ```
 
-Server menyimpan queue dan result in-memory. Agent melakukan register, heartbeat, long-poll, eksekusi satu job, lalu POST result kembali.
+```mermaid
+sequenceDiagram
+  participant K as Switchyard
+  participant S as node-agent server
+  participant A as Worker agent
+  participant E as Executor
 
-## Executor
+  K->>S: POST /api/dispatch
+  S->>A: gRPC stream or HTTP long-poll
+  A->>A: Prepare workspace context
+  A->>E: Run selected executor
+  E-->>A: Text result
+  A->>S: POST /api/nodes/:id/result
+  S-->>K: GET /api/results/:task_id
+```
 
-| Executor | Binary | Mode | Catatan |
+The server keeps the queue and results in memory. An agent registers, sends heartbeats, receives one job, executes it, and posts the result back. Switchyard remains responsible for board state, retries, review, commit, and push.
+
+## Executors
+
+| Executor | Binary | Mode | Notes |
 |---|---|---|---|
-| `hermes` | `hermes` | `hermes chat -q` | Memakai `HERMES_WORKSPACE` |
-| `codex` | `codex` | `codex exec --full-auto` | Task coding non-interaktif |
-| `commandcode` | `cmd`, `cmdc`, atau `command-code` | `-p ... --yolo` | `cmdc` adalah alias Windows |
-| `shell` | shell OS | `bash -lc` atau `cmd /c` | Internal orchestrator dispatch |
-| `auto` | capability yang tersedia | Hermes, lalu Codex, lalu Command Code | Untuk kompatibilitas |
+| `hermes` | `hermes` | `hermes chat -q` | Uses `HERMES_WORKSPACE` |
+| `codex` | `codex` | `codex exec --full-auto` | Non-interactive coding tasks |
+| `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
+| `shell` | OS shell | `bash -lc` or `cmd /c` | Internal orchestrator dispatch |
+| `auto` | Available capability | Hermes, then Codex, then CommandCode | Compatibility mode |
 
-Agent tidak lagi menebak shell dari isi prompt. Dispatcher mengirim executor secara eksplisit. Field `command` hanya berlaku pada internal shell dispatch, bukan input task user.
+The agent does not infer the shell from prompt contents. The dispatcher sends the executor explicitly. The `command` field is valid only for internal shell dispatch, not for user task input.
 
-### Command Code
+### CommandCode
 
-Command Code didukung melalui headless CLI:
+CommandCode runs through its headless CLI:
 
 ```sh
 cmd -p "<prompt>" --yolo --skip-onboarding --output-format text
 ```
 
-`--yolo` mengizinkan edit file dan shell command. Gunakan executor ini hanya pada node yang dipercaya. Command Code mendukung output JSON, tetapi node-agent saat ini meminta output text agar result task tetap mudah dibaca.
+`--yolo` allows file edits and shell commands. Use this executor only on trusted nodes. The node-agent requests text output so task results stay readable.
 
-Referensi: [headless mode](https://commandcode.ai/docs/headless) dan [CLI reference](https://commandcode.ai/docs/reference/cli).
+References: [headless mode](https://commandcode.ai/docs/headless) and [CLI reference](https://commandcode.ai/docs/reference/cli).
 
-## Register dan capability
+## Register and capabilities
 
-Saat start, agent mencari binary yang tersedia dan mengirim daftar capability:
+At startup the agent finds available binaries and sends capabilities:
 
 ```json
 {
-  "node_id":"mac",
-  "hostname":"worker-mac",
-  "version":"0.3.0",
-  "workspaces":["/Users/<user>/Development"],
-  "executors":["hermes","codex","commandcode","shell"],
-  "versions":{"commandcode":"..."}
+  "node_id": "mac",
+  "hostname": "worker-mac",
+  "version": "0.3.0",
+  "workspaces": ["/Users/<user>/Development"],
+  "executors": ["hermes", "codex", "commandcode", "shell"],
+  "versions": {"commandcode": "..."}
 }
 ```
 
-Server hanya menerima executor eksplisit jika executor tersebut terdaftar pada node yang dipilih. Jika workspace tersedia di beberapa node, server memilih node yang memiliki capability tersebut.
+The server accepts an explicit executor only when it is advertised by the selected node. If multiple nodes provide the same workspace, executor capability is also used for selection.
 
 ## Dispatch API
 
-Semua endpoint `/api/*` dan `/dl/*` menggunakan header `X-Node-Agent-Token` ketika server dan agent dikonfigurasi dengan token.
+All `/api/*` and `/dl/*` endpoints use `X-Node-Agent-Token` when token authentication is configured on both server and agent.
 
-### Kirim AI job
+### Send an AI job
 
 ```sh
 curl -X POST http://<VPS_TAILSCALE_IP>:8788/api/dispatch \
   -H 'Content-Type: application/json' \
   -H "X-Node-Agent-Token: <token>" \
   -d '{
-    "task_id":"t1",
-    "board":"saas",
-    "message":"Perbaiki validasi login",
-    "workspace":"/Users/<user>/Development/saas",
-    "executor":"commandcode"
+    "task_id": "t1",
+    "board": "saas",
+    "message": "Fix login validation",
+    "workspace": "/Users/<user>/Development/saas",
+    "executor": "commandcode"
   }'
 ```
 
 ### Internal shell dispatch
 
-Orchestrator dapat mengirim command konkret setelah menentukan operasi yang harus dijalankan. Payload ini tidak berasal dari field command pada form task:
+The orchestrator may send a concrete command after choosing an internal operation. This payload does not come from the task form:
 
 ```json
 {
-  "task_id":"t2",
-  "board":"saas",
-  "message":"generated by orchestrator",
-  "workspace":"/Users/<user>/Development/saas",
-  "executor":"shell",
-  "command":"git status && pnpm test"
+  "task_id": "t2",
+  "board": "saas",
+  "message": "generated by orchestrator",
+  "workspace": "/Users/<user>/Development/saas",
+  "executor": "shell",
+  "command": "git status && pnpm test"
 }
 ```
 
-Ambil result:
+Fetch the result:
 
 ```sh
 curl -H "X-Node-Agent-Token: <token>" \
   http://<VPS_TAILSCALE_IP>:8788/api/results/t1
 ```
 
-Result berisi `success`, `output`, `error`, dan `duration_ms`.
+Result fields include `success`, `output`, `error`, and `duration_ms`. Dispatch acknowledgements may include `transport` and `delivery_id`; Switchyard uses them for flow diagnostics and idempotent result handling.
 
-### Endpoint
+### Endpoints
 
-| Method | Path | Kegunaan |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Health dan daftar node |
-| GET | `/api/nodes` | Capability dan status node |
-| POST | `/api/nodes/register` | Register agent |
-| POST | `/api/nodes/{id}/heartbeat` | Update idle atau busy |
-| GET | `/api/nodes/{id}/poll` | Long-poll job |
-| POST | `/api/nodes/{id}/result` | Kirim hasil job |
-| POST | `/api/dispatch` | Queue job berdasarkan workspace |
-| GET | `/api/results/{task_id}` | Ambil hasil |
-| GET | `/api/workspaces` | Workspace server dan status node |
-| GET | `/dl/mac` | Download binary Mac |
-| GET | `/dl/windows` | Download binary Windows |
+| GET | `/health` | Health and node list |
+| GET | `/api/nodes` | Node capabilities and status |
+| POST | `/api/nodes/register` | Register an agent |
+| POST | `/api/nodes/{id}/heartbeat` | Update idle or busy state |
+| GET | `/api/nodes/{id}/poll` | Long-poll for a job |
+| POST | `/api/nodes/{id}/result` | Submit a job result |
+| POST | `/api/dispatch` | Queue a job by workspace |
+| GET | `/api/results/{task_id}` | Fetch a result |
+| GET | `/api/workspaces` | Server workspaces and node status |
+| GET | `/dl/mac` | Download the Mac binary |
+| GET | `/dl/windows` | Download the Windows binary |
 
-## Context dan output optimization
+## Context and output optimization
 
-Sebelum executor AI dijalankan, agent menyiapkan context:
+Before starting an AI executor, the agent prepares context:
 
-1. `ensureCodegraph(ws)` memakai index yang ada atau menjalankan `codegraph init` dengan batas 60 detik.
-2. `PrequestNote` dari server diprioritaskan.
-3. Jika note kosong, agent membaca 100 baris pertama `AGENTS.md`, lalu `README.md`.
-4. Prompt akhir menggabungkan prerequisites, status codegraph, dan message task.
+1. `ensureCodegraph(ws)` uses an existing index or runs `codegraph init` with a 60-second limit.
+2. `PrequestNote` from the server takes priority.
+3. When the note is empty, the agent reads the first 100 lines of `AGENTS.md`, then `README.md`.
+4. The final prompt combines prerequisites, codegraph status, and the task message.
 
-Execution pipeline dirancang untuk mengurangi context yang dikirim ke model:
+The pipeline reduces model context through:
 
-- codegraph menyediakan index lokal agar agent tidak perlu membaca seluruh repository;
-- RTK mereduksi output command verbose sebelum masuk ke context;
-- caveman merangkum output job sebelum dikirim kembali ke orchestrator.
+- codegraph — local structural index, so the agent need not read the entire repository;
+- RTK — reduces verbose command output before it enters context;
+- caveman — target result compression before output returns to the orchestrator.
 
-Codegraph sudah menjadi preflight. RTK saat ini digunakan pada shell rewrite path. Adapter caveman masih perlu diaktifkan pada result pipeline agar rangkaian ini berlaku untuk semua executor.
+Codegraph is already a preflight. RTK is used on the shell rewrite path. The caveman adapter still needs to be enabled in the result pipeline before it becomes mandatory for every executor.
 
-Kegagalan codegraph bersifat non-fatal. Job tetap dapat berjalan tanpa index.
+Codegraph failure is non-fatal. Jobs can run without an index.
 
-## Konfigurasi
+## Configuration
 
-Environment server:
+Server environment:
 
 ```sh
 NODE_AGENT_ADDR=:8788
@@ -148,15 +165,18 @@ NODE_AGENT_GRPC_ADDR=:8789
 NODE_AGENT_GRPC_ENABLED=1
 NODE_AGENT_TOKEN=<shared-secret>
 NODE_AGENT_DIST_DIR=./dist
-
-# Agent transport
-NODE_AGENT_TRANSPORT=auto             # auto, grpc, http
-NODE_AGENT_GRPC_TARGET=<VPS_TAILSCALE_IP>:8789
-
-`auto` prefers gRPC when `NODE_AGENT_GRPC_TARGET` is set. Connection or stream failure falls back to the existing HTTP long-poll lane. `grpc` fails loudly if gRPC is unavailable; `http` forces compatibility mode. gRPC uses HTTP/2 with JSON codec in phase 1, shared token metadata, and Tailscale transport security. Keep port `8789` private to the tailnet.
 ```
 
-Environment agent:
+Agent transport:
+
+```sh
+NODE_AGENT_TRANSPORT=auto             # auto | grpc | http
+NODE_AGENT_GRPC_TARGET=<VPS_TAILSCALE_IP>:8789
+```
+
+`auto` prefers gRPC when `NODE_AGENT_GRPC_TARGET` is set. Connection or stream failure falls back to HTTP long-poll. `grpc` fails loudly when gRPC is unavailable. `http` forces compatibility mode. Phase 1 gRPC uses HTTP/2 with a JSON codec and shared token metadata. Keep port `8789` private to the tailnet.
+
+Agent environment:
 
 ```sh
 NODE_AGENT_SERVER=http://<VPS_TAILSCALE_IP>:8788
@@ -166,11 +186,11 @@ NODE_AGENT_JOB_TIMEOUT=600
 NODE_AGENT_NO_RTK=1
 ```
 
-`NODE_AGENT_NO_RTK=1` menonaktifkan rewrite `rtk` pada executor shell. Jika tidak diset, agent mencoba `rtk hook check` lalu `rtk rewrite`, masing-masing dengan batas 800 ms, dan memakai command asli jika rewrite gagal. RTK adalah binary dari proyek `rtk-ai/rtk`; nama executable-nya tetap `rtk`.
+`NODE_AGENT_NO_RTK=1` disables `rtk` rewriting for shell executors. Without it, the agent tries `rtk hook check` and then `rtk rewrite`, each with an 800 ms limit, and uses the original command when rewriting fails. The executable name remains `rtk`.
 
-Token harus sama pada server dan semua agent. Simpan token di `~/.hermes/node-agent.env` dengan mode file `0600`.
+The token must match on the server and every agent. Store it in `~/.hermes/node-agent.env` with file mode `0600`.
 
-## Instalasi server di VPS
+## Install the server on the VPS
 
 ```sh
 cd ~/apps/node-agent
@@ -179,55 +199,54 @@ NODE_AGENT_TOKEN=<token> ./ctl.sh start
 curl -H "X-Node-Agent-Token: <token>" http://<VPS_TAILSCALE_IP>:8788/health
 ```
 
-`ctl.sh` juga membangun binary silang dan menyajikannya melalui `/dl/mac` serta `/dl/windows`.
+`ctl.sh` also cross-builds worker binaries and serves them through `/dl/mac` and `/dl/windows`.
 
-## Instalasi agent Mac
+## Install the Mac agent
 
-Upgrade agent Mac boleh ditunda setelah server VPS dan kanban-board diperbarui. Binary
-lama tetap dapat terhubung, tetapi capability baru belum akan terdaftar sampai agent
-di-install ulang.
+VPS server upgrades do not replace the agent binary running on Mac. Install the Mac worker separately:
 
 ```sh
-NODE_AGENT_TOKEN=<token-yang-sama-dengan-VPS> ./scripts/install-mac.sh
+NODE_AGENT_TOKEN=<same-token-as-VPS> ./scripts/install-mac.sh
 ```
 
-Installer mengunduh binary, menulis LaunchAgent dengan KeepAlive, lalu memverifikasi register.
+The installer downloads the binary, writes a KeepAlive LaunchAgent, and verifies registration.
 
-## Instalasi agent Windows
+## Install the Windows agent
 
 ```powershell
 cd C:\Users\<user>\apps\node-agent
-$env:NODE_AGENT_TOKEN = "<token-yang-sama-dengan-VPS>"
+$env:NODE_AGENT_TOKEN = "<same-token-as-VPS>"
 .\scripts\install-windows.ps1
 ```
 
-Installer memakai Scheduled Task saat logon dan supervisor untuk restart ketika binary berhenti. Alias Command Code pada Windows adalah `cmdc`, karena `cmd` adalah command shell bawaan Windows.
+The installer uses a Scheduled Task at logon and a supervisor to restart the binary when it exits. The Windows CommandCode alias is `cmdc`; `cmd` is the built-in command shell.
 
 ## Workspace routing
 
-Server mencocokkan path task dengan prefix workspace yang dikirim agent saat register.
+The server matches task paths against prefixes advertised by agents:
 
-- `/Users/...` biasanya menuju node Mac.
-- `C:\...` biasanya menuju node Windows.
-- Jika beberapa node memiliki workspace yang sama, capability executor ikut dipakai sebagai filter.
-- Jika workspace tidak cocok, server dapat memilih node online pertama untuk `auto`.
+- `/Users/...` usually routes to a Mac node;
+- `C:\...` usually routes to a Windows node;
+- when multiple nodes share a workspace, executor capability filters the candidates;
+- when no workspace matches, `auto` may select the first online node.
 
-Workspace agent dibaca dari `~/.hermes/workspaces.json`:
+Agent workspaces are read from `~/.hermes/workspaces.json`:
 
 ```json
-{"workspaces":[{"path":"/Users/<user>/Development"}]}
+{"workspaces": [{"path": "/Users/<user>/Development"}]}
 ```
 
-## Timeout dan status
+Switchyard uses the same file as its workspace source of truth. Keep workspace IDs, host, OS, notes, and unknown metadata intact when editing it.
 
-Default timeout job adalah 600 detik. Job yang melewati batas dibatalkan dan result dikirim sebagai gagal. Heartbeat memakai status `idle` atau `busy` agar server tidak mengirim pekerjaan baru ke agent yang sedang bekerja.
+## Timeout and status
 
-Agent tidak melakukan commit atau push sebagai bagian dari dispatch kanban. Kanban mengambil diff dan menjalankan approval melalui review gate.
+Default job timeout is 600 seconds. Timed-out jobs are cancelled and returned as failures. Heartbeats use `idle` or `busy` so the server does not send work to a busy agent.
 
-## Build dan test
+The agent never commits or pushes as part of a Switchyard dispatch. Switchyard fetches the diff and performs approval through its review gate.
 
-Build server dan build agent adalah langkah terpisah. Build di VPS tidak mengubah
-binary agent yang sedang berjalan di Mac atau Windows.
+## Build and test
+
+Server and worker builds are separate. Building on the VPS does not replace an agent binary already running on Mac or Windows.
 
 ```sh
 go test ./...
@@ -243,24 +262,24 @@ GOOS=windows GOARCH=amd64 go build -o dist/node-agent-windows-amd64.exe ./cmd/ag
 
 ### `401 unauthorized`
 
-Pastikan `NODE_AGENT_TOKEN` sama pada server dan agent. Pastikan client mengirim header `X-Node-Agent-Token`.
+Verify `NODE_AGENT_TOKEN` matches on server and agent. Verify the client sends `X-Node-Agent-Token`.
 
 ### `executor unavailable on node`
 
-Jalankan binary executor pada host worker dan restart node-agent agar register capability diperbarui. Cek `/api/nodes`.
+Install the executor binary on the worker host and restart node-agent so registration capabilities refresh. Check `/api/nodes`.
 
-### Node terdaftar tetapi workspace tidak dirutekan
+### Node registered but workspace is not routed
 
-Pastikan path di `workspaces.json` adalah prefix dari path task. Perbedaan slash, drive letter, atau workspace parent yang salah dapat membuat route tidak cocok.
+Verify the path in `workspaces.json` is a prefix of the task path. Slash differences, drive-letter differences, or an incorrect parent workspace can prevent a match.
 
-### Command Code gagal start
+### CommandCode fails to start
 
-Linux dan macOS membutuhkan `cmd` atau `command-code`. Windows membutuhkan `cmdc` atau `command-code`. Jalankan `cmd --version`, `cmdc --version`, atau `command-code --version` secara lokal pada user yang menjalankan service.
+Linux and macOS require `cmd` or `command-code`. Windows requires `cmdc` or `command-code`. Run `cmd --version`, `cmdc --version`, or `command-code --version` locally as the service user.
 
-## Repository terkait
+## Related repositories and references
 
-- `kanban-board` repository: board, dispatcher, dan review gate.
-- [Command Code CLI reference](https://commandcode.ai/docs/reference/cli).
-- [Command Code headless mode](https://commandcode.ai/docs/headless).
-- [RTK](https://github.com/rtk-ai/rtk): command output reduction.
-- [Caveman](https://github.com/JuliusBrussee/caveman): result compression target.
+- [Switchyard](https://github.com/adityahimaone/switchyard) — control plane, dispatcher, and review gate
+- [CommandCode CLI reference](https://commandcode.ai/docs/reference/cli)
+- [CommandCode headless mode](https://commandcode.ai/docs/headless)
+- [RTK](https://github.com/rtk-ai/rtk) — command output reduction
+- [Caveman](https://github.com/JuliusBrussee/caveman) — result compression target
