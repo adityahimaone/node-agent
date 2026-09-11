@@ -371,8 +371,9 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 			return "", false, "executor_unavailable: codex"
 		}
 		resolvedBin = bin
-		resolvedArgs = []string{"exec", "--full-auto"}
-		cmd = exec.CommandContext(ctx, bin, "exec", "--full-auto", prompt)
+		resolvedBin = bin
+		resolvedArgs = []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--color", "never"}
+		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
 	case "commandcode":
 		bin := commandCodeBin()
 		if bin == "" {
