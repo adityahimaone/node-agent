@@ -316,12 +316,19 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	_ = os.MkdirAll(tmpDir, 0755)
 	logFile := filepath.Join(tmpDir, "run.log")
 
-	// Context build: codegraph ensure + project prerequisites, then prompt.
-	cgStatus := ensureCodegraph(ws)
-	prequest := readPrequest(ws, job.PrequestNote)
+	// AI executors receive project context. Shell is a direct terminal fast path:
+	// no CodeGraph init, README/AGENTS injection, or Hermes session preamble.
+	executor := strings.ToLower(strings.TrimSpace(job.Executor))
+	if executor == "" {
+		executor = "auto"
+	}
 	prompt := job.Message
-	if prequest != "" || cgStatus != "" {
-		prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
+	if executor != "shell" {
+		cgStatus := ensureCodegraph(ws)
+		prequest := readPrequest(ws, job.PrequestNote)
+		if prequest != "" || cgStatus != "" {
+			prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), jobTimeout())
@@ -334,36 +341,45 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		shell, shellFlag = "cmd", "/c"
 	}
 
-	executor := strings.ToLower(strings.TrimSpace(job.Executor))
-	if executor == "" {
-		executor = "auto"
-	}
 	var cmd *exec.Cmd
+	var resolvedBin string
+	var resolvedArgs []string
+	var resolvedEnv []string
+
 	switch executor {
 	case "shell":
 		command := job.Command
 		if strings.TrimSpace(command) == "" {
 			return "", false, "shell executor requires command"
 		}
-		cmd = exec.CommandContext(ctx, shell, shellFlag, rewriteShellCmd(command))
+		resolvedBin = shell
+		resolvedArgs = []string{shellFlag, rewriteShellCmd(command)}
+		cmd = exec.CommandContext(ctx, resolvedBin, resolvedArgs...)
 	case "hermes":
 		bin := findBin("hermes")
 		if bin == "" {
 			return "", false, "executor_unavailable: hermes"
 		}
+		resolvedBin = bin
+		resolvedArgs = []string{"chat", "-q"}
+		resolvedEnv = append(os.Environ(), "HERMES_WORKSPACE="+ws)
 		cmd = exec.CommandContext(ctx, bin, "chat", "-q", prompt)
-		cmd.Env = append(os.Environ(), "HERMES_WORKSPACE="+ws)
+		cmd.Env = resolvedEnv
 	case "codex":
 		bin := findBin("codex")
 		if bin == "" {
 			return "", false, "executor_unavailable: codex"
 		}
+		resolvedBin = bin
+		resolvedArgs = []string{"exec", "--full-auto"}
 		cmd = exec.CommandContext(ctx, bin, "exec", "--full-auto", prompt)
 	case "commandcode":
 		bin := commandCodeBin()
 		if bin == "" {
 			return "", false, "executor_unavailable: commandcode (cmd/cmdc)"
 		}
+		resolvedBin = bin
+		resolvedArgs = []string{"-p", "--yolo", "--skip-onboarding", "--output-format", "text"}
 		cmd = exec.CommandContext(ctx, bin, "-p", prompt, "--yolo", "--skip-onboarding", "--output-format", "text")
 	case "auto":
 		// Auto preserves the historical preference but remains explicit in the result.
@@ -385,6 +401,13 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	}
 	cmd.Dir = ws
 	out, err := cmd.CombinedOutput()
+	// Provenance header: first line of every result proves which binary ran.
+	provenance := fmt.Sprintf("provenance executor=%s requested=%s bin=%s args=%q ws=%s",
+		executor, strings.ToLower(strings.TrimSpace(job.Executor)), resolvedBin, resolvedArgs, ws)
+	proof := fmt.Sprintf("EXECUTOR_PROOF=%s", executor)
+	out = append([]byte(provenance+"\n"), out...)
+	out = append(out, []byte("\n"+proof+"\n"+provenance+"\n")...)
+
 	_ = os.WriteFile(logFile, out, 0644)
 	if ctx.Err() == context.DeadlineExceeded {
 		return string(out), false, fmt.Sprintf("job timed out after %s", jobTimeout())
