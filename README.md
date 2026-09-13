@@ -43,10 +43,10 @@ The server keeps the queue and results in memory. An agent registers, sends hear
 | `hermes` | `hermes` | `hermes chat -q` | Uses `HERMES_WORKSPACE` |
 | `codex` | `codex` | `codex exec --full-auto` | Non-interactive coding tasks |
 | `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
-| `shell` | OS shell | `bash -lc` or `cmd /c` | Internal orchestrator dispatch |
+| `shell` | OS shell | `bash -lc` or `cmd /c` | `command` only; `body` is description — empty `command` rejected |
 | `auto` | Available capability | Hermes, then Codex, then CommandCode | Compatibility mode |
 
-The agent does not infer the shell from prompt contents. The dispatcher sends the executor explicitly. The `command` field is valid only for internal shell dispatch, not for user task input.
+The agent does not infer the shell from prompt contents. The dispatcher sends the executor explicitly. For `shell`, the `command` field is the only executed input; `body` is descriptive text and is never executed. Empty/whitespace `command` is rejected by Switchyard and by the agent.
 
 ### CommandCode
 
@@ -98,7 +98,7 @@ curl -X POST http://<VPS_TAILSCALE_IP>:8788/api/dispatch \
 
 ### Internal shell dispatch
 
-The orchestrator may send a concrete command after choosing an internal operation. This payload does not come from the task form:
+Switchyard creates tasks with `executor: "shell"` and a dedicated `command`. The task dialog exposes `Shell Command` separately from the description; `body` never becomes the command:
 
 ```json
 {
@@ -140,20 +140,26 @@ Result fields include `success`, `output`, `error`, and `duration_ms`. Dispatch 
 
 Before starting an AI executor, the agent prepares context:
 
-1. `ensureCodegraph(ws)` uses an existing index or runs `codegraph init` with a 60-second limit.
-2. `PrequestNote` from the server takes priority.
+1. `ensureCodegraph(ws)` uses an existing `.codegraph/` index or runs `codegraph init` with a 60-second limit.
+2. `PrequestNote` from Switchyard/workspace registry takes priority.
 3. When the note is empty, the agent reads the first 100 lines of `AGENTS.md`, then `README.md`.
-4. The final prompt combines prerequisites, codegraph status, and the task message.
+4. The final AI prompt combines prerequisites, codegraph status, and the task message.
+
+Shell is a separate fast path:
+
+- default: execute only `command` through `bash -lc` (or `cmd /c` on Windows);
+- `body` is descriptive text and is never executed;
+- empty/whitespace `command` is rejected by Switchyard and node-agent;
+- `NODE_AGENT_SHELL_PREFLIGHT=1` exposes codegraph/prequest through `NODE_AGENT_CODEGRAPH_STATUS` and `NODE_AGENT_PREQUEST`, without changing command text;
+- RTK rewrite runs within bounded 800 ms checks; `NODE_AGENT_SHELL_CAVEMAN=1` may compact output over 8 KiB with a 2-second fail-open cap.
 
 The pipeline reduces model context through:
 
-- codegraph — local structural index, so the agent need not read the entire repository;
-- RTK — reduces verbose command output before it enters context;
-- caveman — target result compression before output returns to the orchestrator.
+- codegraph — local structural index for AI executors;
+- RTK — shell command/output reduction;
+- caveman — optional shell result compression, gated by environment.
 
-Codegraph is already a preflight. RTK is used on the shell rewrite path. The caveman adapter still needs to be enabled in the result pipeline before it becomes mandatory for every executor.
-
-Codegraph failure is non-fatal. Jobs can run without an index.
+Codegraph failure is non-fatal. Jobs can run without an index. Shell preflight and output compaction are opt-in, not required for basic shell execution.
 
 ## Configuration
 
