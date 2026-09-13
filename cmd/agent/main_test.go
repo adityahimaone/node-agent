@@ -64,6 +64,25 @@ func TestRunJobShellFastPathDoesNotLeakHermesPreamble(t *testing.T) {
 	}
 }
 
+func TestRunJobShellPreflightUsesEnvironment(t *testing.T) {
+	ws := mustTempDir(t)
+	_ = os.WriteFile(filepath.Join(ws, "README.md"), []byte("shell preflight context"), 0o644)
+	t.Setenv("NODE_AGENT_SHELL_PREFLIGHT", "1")
+	t.Setenv("NODE_AGENT_NO_RTK", "1")
+	out, ok, errStr := runJob(transport.DispatchRequest{
+		TaskID:    "t-shell-preflight",
+		Workspace: ws,
+		Executor:  "shell",
+		Command:   "printf '%s\\n' \"$NODE_AGENT_CODEGRAPH_STATUS\" \"$NODE_AGENT_PREQUEST\"",
+	})
+	if !ok {
+		t.Fatalf("shell preflight failed err=%q out=%.500s", errStr, out)
+	}
+	if !strings.Contains(out, "shell preflight context") || !strings.Contains(strings.ToLower(out), "codegraph") {
+		t.Fatalf("shell preflight env missing, out=%.500s", out)
+	}
+}
+
 func TestRewriteShellCmd(t *testing.T) {
 	cases := []struct{ name, in string }{
 		{"known git", "git status"},

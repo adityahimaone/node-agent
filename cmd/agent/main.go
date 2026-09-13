@@ -323,11 +323,21 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		executor = "auto"
 	}
 	prompt := job.Message
-	if executor != "shell" {
+	useShellPreflight := executor == "shell" && os.Getenv("NODE_AGENT_SHELL_PREFLIGHT") == "1"
+	var shellContext []string
+	if executor != "shell" || useShellPreflight {
 		cgStatus := ensureCodegraph(ws)
 		prequest := readPrequest(ws, job.PrequestNote)
-		if prequest != "" || cgStatus != "" {
+		if executor != "shell" && (prequest != "" || cgStatus != "") {
 			prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
+		}
+		if useShellPreflight {
+			// Shell receives context through environment, never by mutating command text.
+			// ponytail: expose via NODE_AGENT_* env; add when shell tasks need repo graph without prompt injection cost.
+			shellContext = []string{"NODE_AGENT_CODEGRAPH_STATUS=" + cgStatus}
+			if prequest != "" {
+				shellContext = append(shellContext, "NODE_AGENT_PREQUEST="+prequest)
+			}
 		}
 	}
 
@@ -355,6 +365,9 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		resolvedBin = shell
 		resolvedArgs = []string{shellFlag, rewriteShellCmd(command)}
 		cmd = exec.CommandContext(ctx, resolvedBin, resolvedArgs...)
+		if useShellPreflight {
+			cmd.Env = append(os.Environ(), shellContext...)
+		}
 	case "hermes":
 		bin := findBin("hermes")
 		if bin == "" {
@@ -402,6 +415,10 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	}
 	cmd.Dir = ws
 	out, err := cmd.CombinedOutput()
+	// ponytail: shell caveman gated behind NODE_AGENT_SHELL_CAVEMAN=1; compress tail only when payload >8k and LLM path available
+	if executor == "shell" && os.Getenv("NODE_AGENT_SHELL_CAVEMAN") == "1" {
+		out = maybeCompressShellOutput(out)
+	}
 	// Provenance header: first line of every result proves which binary ran.
 	provenance := fmt.Sprintf("provenance executor=%s requested=%s bin=%s args=%q ws=%s",
 		executor, strings.ToLower(strings.TrimSpace(job.Executor)), resolvedBin, resolvedArgs, ws)
@@ -510,6 +527,21 @@ func readPrequest(ws, note string) string {
 // form, return rewritten; otherwise raw. 800ms cap so broken rtk never stalls.
 // ponytail: `rtk rewrite` exit code is unstable across versions (observed 3
 // with valid output); rely on non-empty output not starting with "No rewrite".
+func maybeCompressShellOutput(raw []byte) []byte {
+	if len(raw) <= 8192 {
+		return raw
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "rtk", "pipe", "--ultra-compact")
+	cmd.Stdin = bytes.NewReader(raw)
+	compressed, err := cmd.Output()
+	if err != nil || ctx.Err() != nil || len(compressed) == 0 || len(compressed) >= len(raw) {
+		return raw
+	}
+	return compressed
+}
+
 func rewriteShellCmd(raw string) string {
 	if os.Getenv("NODE_AGENT_NO_RTK") == "1" {
 		return raw
