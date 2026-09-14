@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -23,6 +24,15 @@ type Conversation struct {
 	CreatedAt  time.Time `json:"created_at"`
 	LastActive time.Time `json:"last_active"`
 	Messages   []Message `json:"messages"`
+}
+
+type Info struct {
+	ID         string    `json:"id"`
+	Workspace  string    `json:"workspace"`
+	Executor   string    `json:"executor"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastActive time.Time `json:"last_active"`
+	Count      int       `json:"message_count"`
 }
 
 // Store keeps conversations as one JSON file per conversation under
@@ -112,6 +122,50 @@ func (s *Store) GetContext(convID string, limit int) ([]Message, error) {
 		return c.Messages, nil
 	}
 	return c.Messages[len(c.Messages)-limit:], nil
+}
+
+// GetConversation returns full conversation metadata plus messages.
+func (s *Store) GetConversation(convID string) (*Conversation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.read(convID + ".json")
+}
+
+// ListConversations returns metadata for all conversations sorted by last_active desc.
+func (s *Store) ListConversations() ([]Info, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ents, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Info
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		c, err := s.read(e.Name())
+		if err != nil {
+			continue
+		}
+		out = append(out, Info{
+			ID:         c.ID,
+			Workspace:  c.Workspace,
+			Executor:   c.Executor,
+			CreatedAt:  c.CreatedAt,
+			LastActive: c.LastActive,
+			Count:      len(c.Messages),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastActive.After(out[j].LastActive) })
+	return out, nil
+}
+
+// DeleteConversation removes a conversation file.
+func (s *Store) DeleteConversation(convID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return os.Remove(s.path(convID))
 }
 
 func (s *Store) ResetConversation(convID string) error {

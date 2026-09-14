@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"google.golang.org/grpc"
+	"node-agent/internal/conversation"
 	"node-agent/internal/heartbeat"
 	"node-agent/internal/transport"
 )
@@ -152,6 +153,16 @@ func main() {
 	}
 
 	go cleanupResults()
+
+	// Conversation store for server-side conversation management API.
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = os.TempDir()
+	}
+	convStore, err := conversation.NewStore(home)
+	if err != nil {
+		log.Fatalf("conversation store: %v", err)
+	}
 
 	r := chi.NewRouter()
 	r.Use(requireToken(authToken))
@@ -326,6 +337,85 @@ func main() {
 		transport.WriteJSON(w, 200, map[string]any{"workspaces": data["workspaces"], "nodes": reg.List()})
 	})
 
+	// ---- Conversation management API ----
+	// These endpoints let the control plane manage persistent conversations.
+	// The worker agent reads/writes the same store directory, so changes are
+	// visible immediately.
+
+	// List all conversations (metadata only, no message bodies).
+	r.Get("/api/conversations", func(w http.ResponseWriter, r *http.Request) {
+		list, err := convStore.ListConversations()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		transport.WriteJSON(w, 200, list)
+	})
+
+	// Get a conversation including messages.
+	r.Get("/api/conversations/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		if id == "" || strings.ContainsAny(id, "./\\") {
+			http.Error(w, "invalid conversation id", 400)
+			return
+		}
+		c, err := convStore.GetConversation(id)
+		if err != nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		transport.WriteJSON(w, 200, c)
+	})
+
+	// Get messages for a conversation with optional ?limit=N.
+	r.Get("/api/conversations/{id}/messages", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		if id == "" || strings.ContainsAny(id, "./\\") {
+			http.Error(w, "invalid conversation id", 400)
+			return
+		}
+		limit := 100
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := parseLimit(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		msgs, err := convStore.GetContext(id, limit)
+		if err != nil {
+			http.Error(w, "not found", 404)
+			return
+		}
+		transport.WriteJSON(w, 200, msgs)
+	})
+
+	// Reset a conversation (clear messages, keep metadata).
+	r.Post("/api/conversations/{id}/reset", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		if id == "" || strings.ContainsAny(id, "./\\") {
+			http.Error(w, "invalid conversation id", 400)
+			return
+		}
+		if err := convStore.ResetConversation(id); err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		transport.WriteJSON(w, 200, map[string]string{"status": "reset"})
+	})
+
+	// Delete a conversation entirely.
+	r.Delete("/api/conversations/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		if id == "" || strings.ContainsAny(id, "./\\") {
+			http.Error(w, "invalid conversation id", 400)
+			return
+		}
+		if err := convStore.DeleteConversation(id); err != nil {
+			http.Error(w, err.Error(), 404)
+			return
+		}
+		transport.WriteJSON(w, 200, map[string]string{"status": "deleted"})
+	})
+
 	// Serve pre-built agent binaries so a fresh machine only needs curl,
 	// not a full Go toolchain + scp round-trip. Filenames are looked up
 	// through a fixed allowlist so the URL param can never path-traverse
@@ -354,6 +444,20 @@ func main() {
 	if err := http.ListenAndServe(addr, r); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func parseLimit(s string) (int, error) {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, nil
+		}
+		n = n*10 + int(c-'0')
+		if n > 10000 {
+			return 10000, nil
+		}
+	}
+	return n, nil
 }
 
 func nodeSupports(n *heartbeat.Node, executor string) bool {
