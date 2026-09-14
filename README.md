@@ -111,6 +111,13 @@ Switchyard creates tasks with `executor: "shell"` and a dedicated `command`. The
 }
 ```
 
+POST /api/dispatch body accepts `conversation_id`, `append_only`, and
+`context_window`. When `conversation_id` is empty the agent resolves one per
+workspace+executor. `append_only=false` clears history before the prompt.
+The agent stores messages under `$HOME/.node-agent/conversations/*.json`.
+Hermes receives context via prompt assembly; codex/commandcode remain
+stateless for now.
+
 Fetch the result:
 
 ```sh

@@ -64,6 +64,11 @@ type DispatchJob struct {
 	Provider             string `json:"provider"`
 	PrequestNote         string `json:"prequest_note"`
 	LeaseExpiresAtUnixMs int64  `json:"lease_expires_at_unix_ms"`
+	// Persistent chat fields. ConversationID empty => server/agent auto-resolves
+	// per workspace. AppendOnly=false means reset context before this message.
+	ConversationID string `json:"conversation_id,omitempty"`
+	AppendOnly     bool   `json:"append_only,omitempty"`
+	ContextWindow  int    `json:"context_window,omitempty"`
 }
 type ResultAck struct {
 	DeliveryID string `json:"delivery_id"`

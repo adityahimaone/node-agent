@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"node-agent/internal/conversation"
 	"node-agent/internal/transport"
 )
 
@@ -304,6 +305,55 @@ func jobTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+var convStore *conversation.Store
+
+func initConvStore() error {
+	if convStore != nil {
+		return nil
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = os.TempDir()
+	}
+	s, err := conversation.NewStore(home)
+	if err != nil {
+		return err
+	}
+	convStore = s
+	return nil
+}
+
+// resolveConversation returns the conversation id to use for this job. If the
+// job carries an explicit ConversationID, it is used. Otherwise the store picks
+// the most recent conversation for the workspace+executor, creating one when
+// none exists. When AppendOnly is false, the conversation history is cleared
+// before this message so the prompt starts fresh.
+func resolveConversation(job transport.DispatchRequest) (string, error) {
+	if err := initConvStore(); err != nil {
+		return "", err
+	}
+	if job.ConversationID != "" {
+		if !job.AppendOnly {
+			if err := convStore.ResetConversation(job.ConversationID); err != nil {
+				return "", err
+			}
+		}
+		return job.ConversationID, nil
+	}
+	exec := strings.ToLower(strings.TrimSpace(job.Executor))
+	if exec == "" || exec == "auto" {
+		exec = "hermes"
+	}
+	id, err := convStore.EnsureConversation(job.Workspace, exec)
+	if err != nil {
+		return "", err
+	}
+	// Empty ConversationID means persistent workspace chat. Keep history by
+	// default; reset is explicit through a supplied ConversationID plus
+	// append_only=false.
+	return id, nil
+}
+
 func runJob(job transport.DispatchRequest) (output string, ok bool, errStr string) {
 	ws := job.Workspace
 	if ws == "" {
@@ -315,6 +365,12 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	tmpDir := filepath.Join(os.TempDir(), "node-agent-"+job.TaskID)
 	_ = os.MkdirAll(tmpDir, 0755)
 	logFile := filepath.Join(tmpDir, "run.log")
+
+	// Persistent chat: build prompt from conversation history when applicable.
+	convID, convErr := resolveConversation(job)
+	if convErr != nil {
+		log.Printf("conversation resolve: %v (proceeding stateless)", convErr)
+	}
 
 	// AI executors receive project context. Shell is a direct terminal fast path:
 	// no CodeGraph init, README/AGENTS injection, or Hermes session preamble.
@@ -376,7 +432,14 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		resolvedBin = bin
 		resolvedArgs = []string{"chat", "-q"}
 		resolvedEnv = append(os.Environ(), "HERMES_WORKSPACE="+ws)
-		cmd = exec.CommandContext(ctx, bin, "chat", "-q", prompt)
+		hermesPrompt := prompt
+		if convErr == nil && convID != "" {
+			ctxMsgs, err := convStore.GetContext(convID, job.ContextWindow)
+			if err == nil && len(ctxMsgs) > 0 {
+				hermesPrompt = conversation.BuildPrompt(ctxMsgs, prompt)
+			}
+		}
+		cmd = exec.CommandContext(ctx, bin, "chat", "-q", hermesPrompt)
 		cmd.Env = resolvedEnv
 	case "codex":
 		bin := findBin("codex")
@@ -427,6 +490,11 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 	out = append(out, []byte("\n"+proof+"\n"+provenance+"\n")...)
 
 	_ = os.WriteFile(logFile, out, 0644)
+	// Persist assistant response to conversation store when applicable.
+	if convErr == nil && convID != "" {
+		_ = convStore.AppendMessage(convID, "user", prompt)
+		_ = convStore.AppendMessage(convID, "assistant", string(out))
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return string(out), false, fmt.Sprintf("job timed out after %s", jobTimeout())
 	}

@@ -38,6 +38,11 @@ type DispatchRequest struct {
 	// PrequestNote is the workspace prequest (project prerequisites) injected
 	// by the server from workspaces.json Note — prepended to the agent prompt.
 	PrequestNote string `json:"prequest_note,omitempty"`
+	// Persistent chat. ConversationID empty => server/agent auto-resolves per
+	// workspace. AppendOnly=false means reset context before this message.
+	ConversationID string `json:"conversation_id,omitempty"`
+	AppendOnly     bool   `json:"append_only,omitempty"`
+	ContextWindow  int    `json:"context_window,omitempty"`
 }
 
 // Result — agent -> server
