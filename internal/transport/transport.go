@@ -45,6 +45,12 @@ type DispatchRequest struct {
 	ContextWindow  int    `json:"context_window,omitempty"`
 }
 
+// Progress — agent -> server. Sent while executor is still running.
+type ProgressRequest struct {
+	TaskID string `json:"task_id"`
+	Chunk  string `json:"chunk"`
+}
+
 // Result — agent -> server
 type ResultRequest struct {
 	TaskID     string `json:"task_id"`

@@ -296,6 +296,7 @@ func bytesReadAll(r *http.Response) ([]byte, error) {
 // heartbeat status change) with no way to recover except killing the process
 // by hand. Override with NODE_AGENT_JOB_TIMEOUT (seconds).
 func jobTimeout() time.Duration {
+	// Keep this in sync with the control plane's RemoteJobTimeout default.
 	secs := 600
 	if v := os.Getenv("NODE_AGENT_JOB_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -477,11 +478,15 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		return "", false, fmt.Sprintf("unknown executor %q", executor)
 	}
 	cmd.Dir = ws
-	out, err := cmd.CombinedOutput()
+	out, err := streamCommand(cmd, job.TaskID)
 	// ponytail: shell caveman gated behind NODE_AGENT_SHELL_CAVEMAN=1; compress tail only when payload >8k and LLM path available
 	if executor == "shell" && os.Getenv("NODE_AGENT_SHELL_CAVEMAN") == "1" {
 		out = maybeCompressShellOutput(out)
 	}
+
+	// streamCommand persists every chunk before process completion. Keep final
+	// provenance/result formatting unchanged; live UI reads persisted chunks.
+
 	// Provenance header: first line of every result proves which binary ran.
 	provenance := fmt.Sprintf("provenance executor=%s requested=%s bin=%s args=%q ws=%s",
 		executor, strings.ToLower(strings.TrimSpace(job.Executor)), resolvedBin, resolvedArgs, ws)
@@ -496,7 +501,7 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		_ = convStore.AppendMessage(convID, "assistant", string(out))
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return string(out), false, fmt.Sprintf("job timed out after %s", jobTimeout())
+		return string(out), false, fmt.Sprintf("node_agent_job_timeout: job timed out after %s", jobTimeout())
 	}
 	if err != nil {
 		return string(out), false, err.Error()
@@ -652,4 +657,117 @@ func findBin(name string) string {
 		return b
 	}
 	return ""
+}
+
+func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	stdoutCh := make(chan []byte, 64)
+	stderrCh := make(chan []byte, 64)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				b := make([]byte, n)
+				copy(b, buf[:n])
+				stdoutCh <- b
+			}
+			if err != nil {
+				close(stdoutCh)
+				return
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				b := make([]byte, n)
+				copy(b, buf[:n])
+				stderrCh <- b
+			}
+			if err != nil {
+				close(stderrCh)
+				return
+			}
+		}
+	}()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	var out []byte
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
+	var pending []byte
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		_ = postJSON(nodeAgentBase()+"/api/nodes/progress", transport.ProgressRequest{TaskID: taskID, Chunk: string(pending)})
+		pending = nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	waitErr := error(nil)
+	stdoutOpen, stderrOpen := true, true
+	for stdoutOpen || stderrOpen || pending != nil {
+		select {
+		case chunk, ok := <-stdoutCh:
+			if !ok {
+				stdoutOpen = false
+				continue
+			}
+			out = append(out, chunk...)
+			pending = append(pending, chunk...)
+		case chunk, ok := <-stderrCh:
+			if !ok {
+				stderrOpen = false
+				continue
+			}
+			out = append(out, chunk...)
+			pending = append(pending, chunk...)
+		case <-ticker.C:
+			flush()
+		case waitErr = <-done:
+			// pump remaining after process exit before leaving
+			for {
+				select {
+				case chunk, ok := <-stdoutCh:
+					if !ok {
+						stdoutOpen = false
+						break
+					}
+					out = append(out, chunk...)
+					pending = append(pending, chunk...)
+					continue
+				case chunk, ok := <-stderrCh:
+					if !ok {
+						stderrOpen = false
+						break
+					}
+					out = append(out, chunk...)
+					pending = append(pending, chunk...)
+					continue
+				default:
+				}
+				break
+			}
+			flush()
+			stdoutOpen, stderrOpen = false, false
+		}
+		if waitErr != nil && !stdoutOpen && !stderrOpen {
+			break
+		}
+	}
+	flush()
+	return out, waitErr
+}
+
+func nodeAgentBase() string {
+	if v := os.Getenv("NODE_AGENT_SERVER"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://100.64.0.1:8788"
 }

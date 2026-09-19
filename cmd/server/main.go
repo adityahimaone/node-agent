@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +21,12 @@ import (
 )
 
 var (
-	reg     = heartbeat.New(45 * time.Second)
-	queues  = map[string]chan transport.DispatchRequest{}
-	qmu     sync.Mutex
-	results = map[string]storedResult{}
-	rmu     sync.Mutex
+	reg      = heartbeat.New(45 * time.Second)
+	queues   = map[string]chan transport.DispatchRequest{}
+	qmu      sync.Mutex
+	results  = map[string]storedResult{}
+	progress = map[string]string{}
+	rmu      sync.Mutex
 )
 
 // storedResult wraps a ResultRequest with the time it was stored, so stale
@@ -230,6 +232,47 @@ func main() {
 		rmu.Unlock()
 		log.Printf("result %s from %s success=%v %dms", req.TaskID, id, req.Success, req.DurationMs)
 		transport.WriteJSON(w, 200, map[string]string{"status": "ok"})
+	})
+	r.Post("/api/nodes/progress", func(w http.ResponseWriter, r *http.Request) {
+		var req transport.ProgressRequest
+		if err := transport.ReadJSON(r, &req); err != nil || req.TaskID == "" {
+			http.Error(w, "invalid progress", 400)
+			return
+		}
+		rmu.Lock()
+		progress[req.TaskID] += req.Chunk
+		// cap at 512KB to avoid unbounded growth
+		if len(progress[req.TaskID]) > 512*1024 {
+			progress[req.TaskID] = progress[req.TaskID][len(progress[req.TaskID])-512*1024:]
+		}
+		rmu.Unlock()
+		transport.WriteJSON(w, 200, map[string]string{"status": "ok"})
+	})
+	r.Get("/api/progress/{task_id}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "task_id")
+		offStr := r.URL.Query().Get("offset")
+		off := 0
+		if offStr != "" {
+			if n, err := strconv.Atoi(offStr); err == nil {
+				off = n
+			}
+		}
+		rmu.Lock()
+		full := progress[id]
+		sr, hasResult := results[id]
+		rmu.Unlock()
+		text := ""
+		if off < len(full) {
+			text = full[off:]
+		} else if off > len(full) {
+			text = full
+			off = 0
+		}
+		done := hasResult
+		if hasResult && off >= len(full) {
+			// still need to signal done so poller stops
+		}
+		transport.WriteJSON(w, 200, map[string]any{"task_id": id, "text": text, "offset": off + len(text), "done": done, "has_result": hasResult, "result": sr.res})
 	})
 	r.Post("/api/dispatch", func(w http.ResponseWriter, r *http.Request) {
 		var req transport.DispatchRequest
