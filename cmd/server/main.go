@@ -338,6 +338,13 @@ func main() {
 				return
 			}
 		}
+		// A retry can reuse task_id. Clear prior result/progress before enqueueing,
+		// otherwise control plane can read stale result immediately.
+		rmu.Lock()
+		delete(results, req.TaskID)
+		delete(progress, req.TaskID)
+		rmu.Unlock()
+
 		// Inject PrequestNote: match req.Workspace against workspaces.json
 		// paths (longest prefix) and copy that workspace's Note, so the
 		// agent gets project prerequisites without reading it itself.

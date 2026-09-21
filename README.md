@@ -46,7 +46,7 @@ The server keeps the queue and results in memory. An agent registers, sends hear
 | `shell` | OS shell | `bash -lc` or `cmd /c` | `command` only; `body` is description — empty `command` rejected |
 | `auto` | Available capability | Hermes, then Codex, then CommandCode | Compatibility mode |
 
-The agent does not infer the shell from prompt contents. The dispatcher sends the executor explicitly. For `shell`, the `command` field is the only executed input; `body` is descriptive text and is never executed. Empty/whitespace `command` is rejected by Switchyard and by the agent.
+The agent does not infer the shell from prompt contents. The dispatcher sends the executor explicitly. Shell supports `execution_mode=direct` (the `command` field is executed once) and `execution_mode=agentic` (a read-only planner selects one command at a time, the worker executes it through shell + RTK, and repeats within `max_iterations`). Agentic mode receives task intent in `message`; destructive command patterns are blocked and the final result remains review-gated by Switchyard.
 
 ### CommandCode
 

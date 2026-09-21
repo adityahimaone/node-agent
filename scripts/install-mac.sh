@@ -37,6 +37,8 @@ cat > "$PLIST_PATH" <<PLIST
     <key>NODE_AGENT_SERVER</key><string>${NODE_AGENT_SERVER}</string>
     <key>NODE_AGENT_TOKEN</key><string>${NODE_AGENT_TOKEN}</string>
     <key>NODE_AGENT_ID</key><string>${NODE_AGENT_ID}</string>
+    <key>NODE_AGENT_SHELL_CAVEMAN</key><string>${NODE_AGENT_SHELL_CAVEMAN:-1}</string>
+    <key>NODE_AGENT_SHELL_PREFLIGHT</key><string>${NODE_AGENT_SHELL_PREFLIGHT:-1}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

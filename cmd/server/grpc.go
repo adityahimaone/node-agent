@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -119,6 +120,12 @@ func (grpcService) Connect(stream transport.NodeAgentService_ConnectServer) erro
 		if f.JobAck != nil {
 			deliveries.AcceptAck(f.JobAck.DeliveryID)
 		}
+		if f.JobProgress != nil && f.JobProgress.TaskID != "" {
+			marker, _ := json.Marshal(map[string]string{"phase": f.JobProgress.Phase, "label": f.JobProgress.Message})
+			rmu.Lock()
+			progress[f.JobProgress.TaskID] += "HERMES_EVENT: " + string(marker) + "\n"
+			rmu.Unlock()
+		}
 		if f.JobResult != nil {
 			accepted := deliveries.AcceptResult(f.JobResult.DeliveryID, session.Result{TaskID: f.JobResult.TaskID, Success: f.JobResult.Success, Output: f.JobResult.Output, Error: f.JobResult.Error})
 			if accepted {
@@ -145,7 +152,7 @@ func dispatchGRPC(req transport.DispatchRequest, nodeID string) (string, bool) {
 		return "", false
 	}
 	d := deliveries.NewDelivery(req.TaskID, req.Board, req.Workspace)
-	job := &transport.ServerFrame{DispatchJob: &transport.DispatchJob{DeliveryID: d.ID, Attempt: 1, TaskID: req.TaskID, Board: req.Board, Message: req.Message, Workspace: req.Workspace, Executor: req.Executor, Command: req.Command, Model: req.Model, Provider: req.Provider, PrequestNote: req.PrequestNote, LeaseExpiresAtUnixMs: d.ExpiresAt.UnixMilli()}}
+	job := &transport.ServerFrame{DispatchJob: &transport.DispatchJob{DeliveryID: d.ID, Attempt: 1, TaskID: req.TaskID, Board: req.Board, Message: req.Message, Workspace: req.Workspace, Executor: req.Executor, Command: req.Command, ExecutionMode: req.ExecutionMode, MaxIterations: req.MaxIterations, Acceptance: req.Acceptance, Model: req.Model, Provider: req.Provider, PrequestNote: req.PrequestNote, ConversationID: req.ConversationID, AppendOnly: req.AppendOnly, ContextWindow: req.ContextWindow, LeaseExpiresAtUnixMs: d.ExpiresAt.UnixMilli()}}
 	select {
 	case s.out <- job:
 		log.Printf("grpc dispatch %s -> %s delivery=%s", req.TaskID, nodeID, d.ID)

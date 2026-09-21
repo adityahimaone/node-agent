@@ -113,3 +113,63 @@ func TestRewriteShellCmdDisabled(t *testing.T) {
 		t.Fatalf("disabled: got %q, want raw", got)
 	}
 }
+
+func TestRewriteShellCmdPreservesDiscoverySemantics(t *testing.T) {
+	for _, command := range []string{"rg --files", "fd -t f", "find . -type f"} {
+		if got := rewriteShellCmd(command); got != command {
+			t.Fatalf("rewriteShellCmd(%q) = %q, want original command", command, got)
+		}
+	}
+}
+
+func TestParseShellPlan(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"normal", `{"action":"run","command":"printf ok","reason":"inspect","phase":"discover"}`, "run"},
+		{"fenced", "```json\n{\"action\":\"complete\",\"reason\":\"tests pass\",\"phase\":\"verify\"}\n```", "complete"},
+		{"prose", `Here is the plan: {"action":"run","command":"go test ./...","reason":"verify","phase":"verify"}`, "run"},
+		{"escaped", `{\"action\":\"run\",\"command\":\"printf ok\",\"reason\":\"inspect\",\"phase\":\"discover\"}`, "run"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseShellPlan(tt.raw)
+			if err != nil {
+				t.Fatalf("parseShellPlan() error = %v", err)
+			}
+			if got.Action != tt.want {
+				t.Fatalf("action = %q, want %q", got.Action, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseShellPlanRejectsInvalidAction(t *testing.T) {
+	if _, err := parseShellPlan(`{"action":"delete","command":"echo no","reason":"bad","phase":"edit"}`); err == nil {
+		t.Fatal("expected invalid action error")
+	}
+}
+
+func TestValidateShellCommand(t *testing.T) {
+	ws := "/tmp/workspace"
+	if err := validateShellCommand("rm -rf .", ws); err == nil {
+		t.Fatal("expected destructive command rejection")
+	}
+	if err := validateShellCommand("cat /etc/passwd", ws); err == nil {
+		t.Fatal("expected outside-workspace rejection")
+	}
+	if err := validateShellCommand("printf ok > /tmp/workspace/out.txt", ws); err != nil {
+		t.Fatalf("workspace command rejected: %v", err)
+	}
+}
+
+func TestLooksLikeDiscoveryCommand(t *testing.T) {
+	if !looksLikeDiscoveryCommand("sed -n '1,80p' app/file.php") {
+		t.Fatal("sed inspection should count as discovery")
+	}
+	if looksLikeDiscoveryCommand("python3 -c 'print(1)'") {
+		t.Fatal("edit/verification command should not count as discovery")
+	}
+}

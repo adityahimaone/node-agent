@@ -29,6 +29,7 @@ type JobAck struct {
 }
 type JobProgress struct {
 	DeliveryID string `json:"delivery_id"`
+	TaskID     string `json:"task_id"`
 	Phase      string `json:"phase"`
 	Message    string `json:"message"`
 }
@@ -60,6 +61,9 @@ type DispatchJob struct {
 	Workspace            string `json:"workspace"`
 	Executor             string `json:"executor"`
 	Command              string `json:"command"`
+	ExecutionMode        string `json:"execution_mode,omitempty"`
+	MaxIterations        int    `json:"max_iterations,omitempty"`
+	Acceptance           string `json:"acceptance,omitempty"`
 	Model                string `json:"model"`
 	Provider             string `json:"provider"`
 	PrequestNote         string `json:"prequest_note"`

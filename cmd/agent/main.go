@@ -140,7 +140,10 @@ func main() {
 		atomic.StoreInt32(&busy, 1)
 		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: "busy"})
 		start := time.Now()
-		output, ok, errStr := runJob(job)
+		output, ok, errStr := runJobWithProgress(job, func(phase, message string) {
+			marker, _ := json.Marshal(map[string]string{"phase": phase, "label": message})
+			_ = postJSON(server+"/api/nodes/progress", transport.ProgressRequest{TaskID: job.TaskID, Chunk: "HERMES_EVENT: " + string(marker) + "\n"})
+		})
 		dur := time.Since(start).Milliseconds()
 		atomic.StoreInt32(&busy, 0)
 
@@ -227,7 +230,11 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, PrequestNote: job.PrequestNote})
+		output, ok, errStr := runJobWithProgress(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
+				log.Printf("progress send: %v", err)
+			}
+		})
 		dur := time.Since(start).Milliseconds()
 		atomic.StoreInt32(&busy, 0)
 		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: dur}}); err != nil {
@@ -306,6 +313,16 @@ func jobTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+func agenticJobTimeout() time.Duration {
+	secs := 1200
+	if v := os.Getenv("NODE_AGENT_SHELL_AGENTIC_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			secs = n
+		}
+	}
+	return time.Duration(secs) * time.Second
+}
+
 var convStore *conversation.Store
 
 func initConvStore() error {
@@ -356,6 +373,16 @@ func resolveConversation(job transport.DispatchRequest) (string, error) {
 }
 
 func runJob(job transport.DispatchRequest) (output string, ok bool, errStr string) {
+	return runJobWithProgress(job, nil)
+}
+
+func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, string)) (output string, ok bool, errStr string) {
+	emit := func(phase, message string) {
+		if onProgress != nil {
+			onProgress(phase, message)
+		}
+	}
+	emit("job_started", "Starting remote agent")
 	ws := job.Workspace
 	if ws == "" {
 		ws = os.ExpandEnv("$HOME")
@@ -380,10 +407,12 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		executor = "auto"
 	}
 	prompt := job.Message
-	useShellPreflight := executor == "shell" && os.Getenv("NODE_AGENT_SHELL_PREFLIGHT") == "1"
+	agentic := executor == "shell" && strings.EqualFold(strings.TrimSpace(job.ExecutionMode), "agentic")
+	useShellPreflight := executor == "shell" && (agentic || os.Getenv("NODE_AGENT_SHELL_PREFLIGHT") == "1")
 	var shellContext []string
 	if executor != "shell" || useShellPreflight {
 		cgStatus := ensureCodegraph(ws)
+		emit("codegraph_preflight", "Checking workspace structure")
 		prequest := readPrequest(ws, job.PrequestNote)
 		if executor != "shell" && (prequest != "" || cgStatus != "") {
 			prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
@@ -395,11 +424,22 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 			if prequest != "" {
 				shellContext = append(shellContext, "NODE_AGENT_PREQUEST="+prequest)
 			}
+			if agentic {
+				prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
+			}
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), jobTimeout())
+	jobDeadline := jobTimeout()
+	if agentic {
+		jobDeadline = agenticJobTimeout()
+		job.Message = prompt
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), jobDeadline)
 	defer cancel()
+	if executor == "shell" && strings.EqualFold(strings.TrimSpace(job.ExecutionMode), "agentic") {
+		return runAgenticShellJob(job, ws, ctx, emit)
+	}
 
 	// Windows has no bash — WSL's bash lacks most coreutils and breaks
 	// chdir to Windows paths. Use cmd /c there, bash -lc elsewhere.
@@ -463,22 +503,25 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		// Auto preserves the historical preference but remains explicit in the result.
 		if findBin("hermes") != "" {
 			job.Executor = "hermes"
-			return runJob(job)
+			return runJobWithProgress(job, onProgress)
 		}
 		if findBin("codex") != "" {
 			job.Executor = "codex"
-			return runJob(job)
+			return runJobWithProgress(job, onProgress)
 		}
 		if commandCodeBin() != "" {
 			job.Executor = "commandcode"
-			return runJob(job)
+			return runJobWithProgress(job, onProgress)
 		}
 		return "", false, "executor_unavailable: auto found no AI executor"
 	default:
 		return "", false, fmt.Sprintf("unknown executor %q", executor)
 	}
+	emit("executor_resolved", "Resolved executor: "+executor)
 	cmd.Dir = ws
+	emit("process_spawned", "Starting agent process")
 	out, err := streamCommand(cmd, job.TaskID)
+	emit("process_exited", "Agent process finished")
 	// ponytail: shell caveman gated behind NODE_AGENT_SHELL_CAVEMAN=1; compress tail only when payload >8k and LLM path available
 	if executor == "shell" && os.Getenv("NODE_AGENT_SHELL_CAVEMAN") == "1" {
 		out = maybeCompressShellOutput(out)
@@ -507,6 +550,308 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 		return string(out), false, err.Error()
 	}
 	return string(out), true, ""
+}
+
+type shellPlan struct {
+	Action  string `json:"action"` // run|complete|blocked
+	Command string `json:"command,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Phase   string `json:"phase,omitempty"` // discover|edit|verify
+}
+
+const maxShellAgentIterations = 24
+
+// runAgenticShellJob gives the planner read-only workspace access and keeps all
+// mutations on the explicit shell path. This preserves shell provenance while
+// allowing the orchestrator to inspect, edit, test, and recover iteratively.
+func runAgenticShellJob(job transport.DispatchRequest, ws string, ctx context.Context, emit func(string, string)) (string, bool, string) {
+	max := job.MaxIterations
+	if max <= 0 {
+		max = 6
+	}
+	if max > maxShellAgentIterations {
+		max = maxShellAgentIterations
+	}
+	iterations := 0
+	discoveryBudget := max / 4
+	if discoveryBudget < 3 {
+		discoveryBudget = 3
+	}
+	lastCommand := ""
+	repeatedCommandCount := 0
+	commandCounts := map[string]int{}
+	finish := func(out string, ok bool, errText string) (string, bool, string) {
+		proof := fmt.Sprintf("provenance executor=shell requested=shell mode=agentic ws=%s iterations=%d", ws, iterations)
+		if out == "" {
+			out = proof
+		} else {
+			out = proof + "\n" + out
+		}
+		return out, ok, errText
+	}
+	transcript := strings.Builder{}
+	transcript.WriteString("Task intent:\n" + job.Message + "\n")
+	if job.Acceptance != "" {
+		transcript.WriteString("Acceptance:\n" + job.Acceptance + "\n")
+	}
+	var lastOutput string
+	for i := 1; i <= max; i++ {
+		iterations = i
+		if err := ctx.Err(); err != nil {
+			return finish(lastOutput, false, "agentic shell timeout")
+		}
+		emit("shell_planning", fmt.Sprintf("Planning shell iteration %d/%d", i, max))
+		directive := fmt.Sprintf("Execution controller: discovery has a budget of %d iteration(s). After discovery, move to edit and then verify. Current iteration is %d/%d.", discoveryBudget, i, max)
+		if i > discoveryBudget {
+			directive += " Discovery budget is exhausted: the next command MUST inspect a target file, edit the requested behavior, or run a focused verification command; do not repeat repository discovery."
+		}
+		if lastCommand != "" {
+			directive += " The immediately previous command was already executed; choose a different command that advances the task: " + lastCommand
+		}
+		plan, err := planShellCommand(ctx, ws, transcript.String()+"\n"+directive, lastOutput)
+		if err != nil {
+			return finish(lastOutput, false, "shell planner: "+err.Error())
+		}
+		plan.Action = strings.ToLower(strings.TrimSpace(plan.Action))
+		if plan.Action == "complete" {
+			if i == 1 {
+				return finish(lastOutput, false, "shell planner completed without executing a command")
+			}
+			transcript.WriteString("Decision: complete — " + plan.Reason + "\n")
+			return finish(lastOutput, true, "")
+		}
+		if plan.Action == "blocked" {
+			return finish(lastOutput, false, "shell planner blocked: "+plan.Reason)
+		}
+		if plan.Action != "run" || strings.TrimSpace(plan.Command) == "" {
+			return finish(lastOutput, false, "shell planner returned an invalid decision")
+		}
+		if err := validateShellCommand(plan.Command, ws); err != nil {
+			emit("shell_blocked", fmt.Sprintf("Iteration %d blocked: %v", i, err))
+			return finish(lastOutput, false, "shell planner proposed a blocked command: "+err.Error())
+		}
+		if strings.TrimSpace(plan.Command) == lastCommand {
+			repeatedCommandCount++
+		} else {
+			repeatedCommandCount = 0
+		}
+		lastCommand = strings.TrimSpace(plan.Command)
+		commandCounts[lastCommand]++
+		if repeatedCommandCount >= 2 || commandCounts[lastCommand] >= 3 {
+			return finish(lastOutput, false, fmt.Sprintf("shell planner repeated command without progress: %s", plan.Command))
+		}
+		phase := plan.Phase
+		if phase == "" {
+			phase = "discover"
+		}
+		if i > discoveryBudget && phase == "discover" && looksLikeDiscoveryCommand(plan.Command) {
+			return finish(lastOutput, false, fmt.Sprintf("planner_discovery_budget_exhausted: discovery exceeded %d iterations; next step must be edit or verify", discoveryBudget))
+		}
+		emit("shell_command", fmt.Sprintf("Iteration %d [%s]: %s", i, phase, plan.Command))
+		out, ok, errText := executeAgenticShell(ctx, job, ws, plan.Command, emit)
+		lastOutput = out
+		plannerOutput := maybeCompressShellOutput([]byte(out))
+		transcript.WriteString(fmt.Sprintf("Iteration %d phase: %s\nCommand: %s\nExit success: %t\nOutput:\n%s\n", i, phase, plan.Command, ok, trimPlannerOutput(string(plannerOutput))))
+		// Keep raw worker output in streamCommand/log history; only planner context gets compacted.
+		if errText != "" {
+			transcript.WriteString("Error: " + errText + "\n")
+		}
+		if !ok && i == max {
+			return finish(out, false, "shell agent exhausted iterations: "+errText)
+		}
+	}
+	return finish(lastOutput, false, "shell agent exhausted iterations")
+}
+
+func looksLikeDiscoveryCommand(command string) bool {
+	first := strings.ToLower(strings.TrimSpace(command))
+	for _, name := range []string{"rg ", "rg\t", "find ", "fd ", "ls ", "sed ", "head ", "tail ", "awk "} {
+		if strings.HasPrefix(first, name) {
+			return true
+		}
+	}
+	return first == "rg" || first == "find" || first == "fd" || first == "ls" || first == "sed" || first == "head" || first == "tail" || first == "awk"
+}
+
+func planShellCommand(ctx context.Context, ws, transcript, lastOutput string) (shellPlan, error) {
+	prompt := `You are a shell task planner. Do not execute commands yourself or use tools. Choose the next single safe shell command for the worker to run. The worker may inspect files, edit files required by the task, run focused tests, and verify the result. The workspace is the command working directory; do not inspect sibling projects or parent-repository paths. Keep discovery bounded: exclude .git, vendor, node_modules, build, dist, cache, and generated directories, and cap listings/searches with head or a focused path. Once a target file has been found, STOP using rg, find, fd, ls, or repository-wide searches: inspect that file with sed/awk/head, then edit it or run a focused verification command. Never propose destructive commands such as deleting broad paths, resetting or cleaning Git, pushing changes, changing permissions broadly, or dropping databases. Return ONLY one valid JSON object matching:
+{"action":"run|complete|blocked","command":"...","reason":"...","phase":"discover|edit|verify"}
+Use action complete only when the acceptance criteria are demonstrably satisfied with evidence. Use blocked only when no safe next step exists.
+
+` + transcript
+	if lastOutput != "" {
+		prompt += "\nLatest worker output:\n" + trimPlannerOutput(lastOutput)
+	}
+	bin := findBin("codex")
+	if bin == "" {
+		return shellPlan{}, fmt.Errorf("read-only planner unavailable: codex not found")
+	}
+	cmd := exec.CommandContext(ctx, bin, "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--color", "never", prompt)
+	cmd.Dir = ws
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// CombinedOutput keeps the real planner failure (quota, model,
+		// auth) instead of a bare "exit status 1" retried forever.
+		msg := strings.TrimSpace(string(out))
+		if len(msg) > 400 {
+			msg = msg[len(msg)-400:]
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return shellPlan{}, fmt.Errorf("codex planner failed: %s", msg)
+	}
+	plan, err := parseShellPlan(string(out))
+	if err == nil {
+		return plan, nil
+	}
+	// One bounded repair call prevents malformed formatting from consuming the
+	// entire execution budget while keeping the primary planner prompt small.
+	repairPrompt := fmt.Sprintf("Return only one valid JSON object for this shell plan. No Markdown and no backslashes before JSON quotes. The action value MUST be exactly one of run, complete, or blocked (never the literal string run|complete|blocked). The phase value MUST be exactly one of discover, edit, or verify. For example: {\"action\":\"run\",\"command\":\"sed -n '1,120p' app/file.php\",\"reason\":\"inspect target\",\"phase\":\"discover\"}. Parse error: %s", err)
+	repair := exec.CommandContext(ctx, bin, "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--color", "never", repairPrompt+"\nOriginal response:\n"+trimPlannerOutput(string(out)))
+	repair.Dir = ws
+	repaired, repairErr := repair.Output()
+	if repairErr != nil {
+		return shellPlan{}, fmt.Errorf("planner_json_invalid: %v", err)
+	}
+	plan, parseErr := parseShellPlan(string(repaired))
+	if parseErr != nil {
+		return shellPlan{}, fmt.Errorf("planner_json_invalid: %v", parseErr)
+	}
+	return plan, nil
+}
+
+func parseShellPlan(raw string) (shellPlan, error) {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "```") {
+		lines := strings.Split(raw, "\n")
+		if len(lines) >= 2 {
+			raw = strings.TrimSpace(strings.Join(lines[1:len(lines)-1], "\n"))
+		}
+	}
+	object, err := firstJSONObject(raw)
+	if err != nil {
+		// Some models echo an escaped JSON object. Normalize only after the
+		// strict parse path fails; command contents remain schema-validated.
+		object, err = firstJSONObject(strings.ReplaceAll(raw, `\"`, `"`))
+		if err != nil {
+			return shellPlan{}, err
+		}
+	}
+	var plan shellPlan
+	if err := json.Unmarshal([]byte(object), &plan); err != nil {
+		return shellPlan{}, err
+	}
+	plan.Action = strings.ToLower(strings.TrimSpace(plan.Action))
+	plan.Phase = strings.ToLower(strings.TrimSpace(plan.Phase))
+	if plan.Action != "run" && plan.Action != "complete" && plan.Action != "blocked" {
+		return shellPlan{}, fmt.Errorf("invalid planner action %q", plan.Action)
+	}
+	if plan.Action == "run" && strings.TrimSpace(plan.Command) == "" {
+		return shellPlan{}, fmt.Errorf("run action requires command")
+	}
+	if plan.Phase != "" && plan.Phase != "discover" && plan.Phase != "edit" && plan.Phase != "verify" {
+		return shellPlan{}, fmt.Errorf("invalid planner phase %q", plan.Phase)
+	}
+	return plan, nil
+}
+
+func firstJSONObject(raw string) (string, error) {
+	start, depth := -1, 0
+	quoted, escaped := false, false
+	for i, r := range raw {
+		if quoted {
+			if escaped {
+				escaped = false
+			} else if r == '\\' {
+				escaped = true
+			} else if r == '"' {
+				quoted = false
+			}
+			continue
+		}
+		if r == '"' {
+			quoted = true
+			continue
+		}
+		if r == '{' {
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		} else if r == '}' && depth > 0 {
+			depth--
+			if depth == 0 {
+				return raw[start : i+1], nil
+			}
+		}
+	}
+	return "", fmt.Errorf("planner did not return a complete JSON object")
+}
+
+func executeAgenticShell(ctx context.Context, job transport.DispatchRequest, ws, command string, emit func(string, string)) (string, bool, string) {
+	shell, flag := "bash", "-lc"
+	if runtime.GOOS == "windows" {
+		shell, flag = "cmd", "/c"
+	}
+	rewritten := rewriteShellCmd(command)
+	cmd := exec.CommandContext(ctx, shell, flag, rewritten)
+	cmd.Dir = ws
+	out, err := streamCommand(cmd, job.TaskID)
+	if err != nil {
+		return string(out), false, err.Error()
+	}
+	return string(out), true, ""
+}
+
+func trimPlannerOutput(raw string) string {
+	if len(raw) > 4096 {
+		// Keep both declarations/context at the top and payload/save logic at
+		// the bottom. Keeping only the head caused the planner to repeat the
+		// same sed command because it never saw the relevant lower section.
+		const half = 2048
+		return raw[:half] + "\n…[middle truncated]…\n" + raw[len(raw)-half:]
+	}
+	return raw
+}
+
+func unsafeShellCommand(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	for _, needle := range []string{"rm -rf", "git reset --hard", "git clean -fd", "git push --force", "git push -f", "sudo ", "chmod -r 777", "mkfs", "dd if=", "drop database", "| sh", "| bash"} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateShellCommand(command, workspace string) error {
+	if unsafeShellCommand(command) {
+		return fmt.Errorf("destructive command blocked")
+	}
+	abs, err := filepath.Abs(workspace)
+	if err != nil {
+		return fmt.Errorf("invalid workspace: %w", err)
+	}
+	for _, token := range strings.Fields(command) {
+		token = strings.Trim(token, "'\"()[]{};,:")
+		// Slash-delimited search/awk regexes such as /item|description|unit/
+		// are expressions, not filesystem paths.
+		if strings.ContainsAny(token, "|{}") {
+			continue
+		}
+		if token == ".." || strings.HasPrefix(token, "../") || strings.Contains(token, "/../") {
+			return fmt.Errorf("path traversal blocked: %s", token)
+		}
+		if !filepath.IsAbs(token) || strings.HasPrefix(token, abs+string(os.PathSeparator)) || token == abs {
+			continue
+		}
+		if strings.HasPrefix(token, "/usr/") || strings.HasPrefix(token, "/bin/") || strings.HasPrefix(token, "/opt/") {
+			continue
+		}
+		return fmt.Errorf("path outside workspace: %s", token)
+	}
+	return nil
 }
 
 func commandCodeBin() string {
@@ -618,6 +963,15 @@ func maybeCompressShellOutput(raw []byte) []byte {
 func rewriteShellCmd(raw string) string {
 	if os.Getenv("NODE_AGENT_NO_RTK") == "1" {
 		return raw
+	}
+	// RTK's generic rewrite can turn discovery commands such as `rg --files`
+	// into incompatible `grep` invocations on macOS. Preserve their semantics;
+	// their output is bounded separately before it reaches planner context.
+	trimmed := strings.TrimSpace(raw)
+	for _, prefix := range []string{"rg", "fd", "find"} {
+		if trimmed == prefix || strings.HasPrefix(trimmed, prefix+" ") {
+			return raw
+		}
 	}
 	bin := findBin("rtk")
 	if bin == "" {

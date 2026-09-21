@@ -27,14 +27,17 @@ type HeartbeatRequest struct {
 
 // Dispatch — server -> agent
 type DispatchRequest struct {
-	TaskID    string `json:"task_id"`
-	Board     string `json:"board"`
-	Message   string `json:"message"`
-	Workspace string `json:"workspace"` // absolute path on agent
-	Model     string `json:"model"`
-	Provider  string `json:"provider"`
-	Executor  string `json:"executor,omitempty"` // auto|hermes|codex|commandcode|shell
-	Command   string `json:"command,omitempty"`  // only used by shell executor
+	TaskID        string `json:"task_id"`
+	Board         string `json:"board"`
+	Message       string `json:"message"`
+	Workspace     string `json:"workspace"` // absolute path on agent
+	Model         string `json:"model"`
+	Provider      string `json:"provider"`
+	Executor      string `json:"executor,omitempty"`       // auto|hermes|codex|commandcode|shell
+	Command       string `json:"command,omitempty"`        // only used by shell executor
+	ExecutionMode string `json:"execution_mode,omitempty"` // direct|agentic
+	MaxIterations int    `json:"max_iterations,omitempty"`
+	Acceptance    string `json:"acceptance,omitempty"`
 	// PrequestNote is the workspace prequest (project prerequisites) injected
 	// by the server from workspaces.json Note — prepended to the agent prompt.
 	PrequestNote string `json:"prequest_note,omitempty"`
