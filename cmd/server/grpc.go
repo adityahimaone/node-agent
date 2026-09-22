@@ -152,7 +152,7 @@ func dispatchGRPC(req transport.DispatchRequest, nodeID string) (string, bool) {
 		return "", false
 	}
 	d := deliveries.NewDelivery(req.TaskID, req.Board, req.Workspace)
-	job := &transport.ServerFrame{DispatchJob: &transport.DispatchJob{DeliveryID: d.ID, Attempt: 1, TaskID: req.TaskID, Board: req.Board, Message: req.Message, Workspace: req.Workspace, Executor: req.Executor, Command: req.Command, ExecutionMode: req.ExecutionMode, MaxIterations: req.MaxIterations, Acceptance: req.Acceptance, Model: req.Model, Provider: req.Provider, PrequestNote: req.PrequestNote, ConversationID: req.ConversationID, AppendOnly: req.AppendOnly, ContextWindow: req.ContextWindow, LeaseExpiresAtUnixMs: d.ExpiresAt.UnixMilli()}}
+	job := &transport.ServerFrame{DispatchJob: &transport.DispatchJob{DeliveryID: d.ID, Attempt: 1, TaskID: req.TaskID, Board: req.Board, Message: req.Message, Workspace: req.Workspace, Executor: req.Executor, Command: req.Command, ExecutionMode: req.ExecutionMode, NoRTK: req.NoRTK, MaxIterations: req.MaxIterations, Acceptance: req.Acceptance, Model: req.Model, Provider: req.Provider, PrequestNote: req.PrequestNote, DSHSessionID: req.DSHSessionID, ConversationID: req.ConversationID, AppendOnly: req.AppendOnly, ContextWindow: req.ContextWindow, LeaseExpiresAtUnixMs: d.ExpiresAt.UnixMilli()}}
 	select {
 	case s.out <- job:
 		log.Printf("grpc dispatch %s -> %s delivery=%s", req.TaskID, nodeID, d.ID)

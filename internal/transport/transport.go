@@ -36,11 +36,14 @@ type DispatchRequest struct {
 	Executor      string `json:"executor,omitempty"`       // auto|hermes|codex|commandcode|shell
 	Command       string `json:"command,omitempty"`        // only used by shell executor
 	ExecutionMode string `json:"execution_mode,omitempty"` // direct|agentic
+	NoRTK         bool   `json:"no_rtk,omitempty"`         // preserve machine-readable command output
 	MaxIterations int    `json:"max_iterations,omitempty"`
 	Acceptance    string `json:"acceptance,omitempty"`
 	// PrequestNote is the workspace prequest (project prerequisites) injected
 	// by the server from workspaces.json Note — prepended to the agent prompt.
 	PrequestNote string `json:"prequest_note,omitempty"`
+	// DSHSessionID resumes same DeepSeek Harness session for task comments.
+	DSHSessionID string `json:"dsh_session_id,omitempty"`
 	// Persistent chat. ConversationID empty => server/agent auto-resolves per
 	// workspace. AppendOnly=false means reset context before this message.
 	ConversationID string `json:"conversation_id,omitempty"`

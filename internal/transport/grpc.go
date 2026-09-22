@@ -62,11 +62,13 @@ type DispatchJob struct {
 	Executor             string `json:"executor"`
 	Command              string `json:"command"`
 	ExecutionMode        string `json:"execution_mode,omitempty"`
+	NoRTK                bool   `json:"no_rtk,omitempty"`
 	MaxIterations        int    `json:"max_iterations,omitempty"`
 	Acceptance           string `json:"acceptance,omitempty"`
 	Model                string `json:"model"`
 	Provider             string `json:"provider"`
 	PrequestNote         string `json:"prequest_note"`
+	DSHSessionID         string `json:"dsh_session_id,omitempty"`
 	LeaseExpiresAtUnixMs int64  `json:"lease_expires_at_unix_ms"`
 	// Persistent chat fields. ConversationID empty => server/agent auto-resolves
 	// per workspace. AppendOnly=false means reset context before this message.

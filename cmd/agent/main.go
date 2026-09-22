@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -37,6 +40,24 @@ var httpClient = &http.Client{Timeout: 10 * time.Second}
 var pollClient = &http.Client{Timeout: 30 * time.Second}
 
 var agentToken = os.Getenv("NODE_AGENT_TOKEN")
+
+var dshWorkspaceMu sync.Mutex
+
+type dshWorkspaceStorage struct {
+	Unit   map[string]any `json:"unit"`
+	Global map[string]any `json:"global"`
+	Tables struct {
+		Workspaces map[string]dshWorkspace `json:"workspaces"`
+	} `json:"tables"`
+}
+
+type dshWorkspace struct {
+	Path       string   `json:"path"`
+	Title      string   `json:"title"`
+	SessionIDs []string `json:"sessionIds"`
+	CreatedAt  string   `json:"createdAt"`
+	UpdatedAt  string   `json:"updatedAt"`
+}
 
 // busy tracks real job state. The previous heartbeatLoop hardcoded
 // Status:"idle" on every tick regardless of whether a job was running,
@@ -230,7 +251,7 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runJobWithProgress(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+		output, ok, errStr := runJobWithProgress(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
@@ -413,7 +434,10 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 	if executor != "shell" || useShellPreflight {
 		cgStatus := ensureCodegraph(ws)
 		emit("codegraph_preflight", "Checking workspace structure")
-		prequest := readPrequest(ws, job.PrequestNote)
+		prequest := ""
+		if strings.TrimSpace(job.DSHSessionID) == "" {
+			prequest = readPrequest(ws, job.PrequestNote)
+		}
 		if executor != "shell" && (prequest != "" || cgStatus != "") {
 			prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
 		}
@@ -460,7 +484,11 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 			return "", false, "shell executor requires command"
 		}
 		resolvedBin = shell
-		resolvedArgs = []string{shellFlag, rewriteShellCmd(command)}
+		if job.NoRTK {
+			resolvedArgs = []string{shellFlag, command}
+		} else {
+			resolvedArgs = []string{shellFlag, rewriteShellCmd(command)}
+		}
 		cmd = exec.CommandContext(ctx, resolvedBin, resolvedArgs...)
 		if useShellPreflight {
 			cmd.Env = append(os.Environ(), shellContext...)
@@ -491,6 +519,22 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 		resolvedBin = bin
 		resolvedArgs = []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--color", "never"}
 		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
+	case "dsh":
+		bin := findBin("dsh")
+		if bin == "" {
+			return "", false, "dsh_unavailable: DeepSeek Harness (dsh) not installed or not on PATH"
+		}
+		if err := validateDSHBinary(bin); err != nil {
+			return "", false, "dsh_unavailable: " + err.Error()
+		}
+		resolvedBin = bin
+		resolvedArgs = deepSeekHarnessArgs(job.DSHSessionID)
+		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
+		// launchd PATH omits Homebrew; dsh's shebang resolves node through env.
+		cmd.Env = append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:"+os.Getenv("PATH"))
+		if strings.TrimSpace(job.Model) != "" {
+			cmd.Env = append(cmd.Env, "DSH_MODEL="+strings.TrimSpace(job.Model))
+		}
 	case "commandcode":
 		bin := commandCodeBin()
 		if bin == "" {
@@ -529,10 +573,29 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 
 	// streamCommand persists every chunk before process completion. Keep final
 	// provenance/result formatting unchanged; live UI reads persisted chunks.
+	sessionID, sessionCWD := parseDeepSeekHarnessSessionEvent(out)
+	if executor == "dsh" && sessionID != "" && os.Getenv("NODE_AGENT_DSH_WORKSPACE_REGISTRATION") != "0" {
+		if registrationErr := registerDeepSeekHarnessWorkspace(ws, sessionID); registrationErr != nil {
+			return string(out), false, "dsh_workspace_registration_failed: " + registrationErr.Error()
+		}
+	}
 
 	// Provenance header: first line of every result proves which binary ran.
 	provenance := fmt.Sprintf("provenance executor=%s requested=%s bin=%s args=%q ws=%s",
 		executor, strings.ToLower(strings.TrimSpace(job.Executor)), resolvedBin, resolvedArgs, ws)
+	if sessionID != "" {
+		provenance += fmt.Sprintf(" dsh_session_id=%s dsh_session_cwd=%s", sessionID, sessionCWD)
+	}
+	if executor == "dsh" && sessionID == "" && err == nil {
+		return string(out), false, "dsh_session_missing: headless --json returned no session event"
+	}
+	if executor == "dsh" && sessionCWD != "" {
+		canonicalWS, canonicalErr := filepath.EvalSymlinks(ws)
+		canonicalCWD, cwdErr := filepath.EvalSymlinks(sessionCWD)
+		if canonicalErr == nil && cwdErr == nil && canonicalWS != canonicalCWD {
+			return string(out), false, fmt.Sprintf("dsh_workspace_mismatch: session cwd=%s workspace=%s", canonicalCWD, canonicalWS)
+		}
+	}
 	proof := fmt.Sprintf("EXECUTOR_PROOF=%s", executor)
 	out = append([]byte(provenance+"\n"), out...)
 	out = append(out, []byte("\n"+proof+"\n"+provenance+"\n")...)
@@ -553,10 +616,108 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 }
 
 type shellPlan struct {
-	Action  string `json:"action"` // run|complete|blocked
+	Action  string `json:"action"` // run|complete|blocked|edit|create
 	Command string `json:"command,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 	Phase   string `json:"phase,omitempty"` // discover|edit|verify
+	Path    string `json:"path,omitempty"`
+	OldStr  string `json:"old_str,omitempty"`
+	NewStr  string `json:"new_str,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+const maxEditSize = 20 * 1024 // 20KB cap per str_replace field
+
+// resolveInWorkspace joins a relative path to the workspace root and verifies
+// it doesn't escape. Shared by edit/create actions and any future path ops.
+func resolveInWorkspace(ws, relPath string) (string, error) {
+	if filepath.IsAbs(relPath) {
+		return "", fmt.Errorf("edit path must be relative to workspace, got absolute: %s", relPath)
+	}
+	absWs, err := filepath.Abs(ws)
+	if err != nil {
+		return "", fmt.Errorf("invalid workspace: %w", err)
+	}
+	target := filepath.Join(absWs, relPath)
+	clean := filepath.Clean(target)
+	if !strings.HasPrefix(clean, absWs+string(os.PathSeparator)) && clean != absWs {
+		return "", fmt.Errorf("path escapes workspace: %s", relPath)
+	}
+	return clean, nil
+}
+
+func applyEdit(ws, relPath, oldStr, newStr string) (string, error) {
+	if len(oldStr) > maxEditSize || len(newStr) > maxEditSize {
+		return "", fmt.Errorf("old_str/new_str exceeds %d byte cap", maxEditSize)
+	}
+	absPath, err := resolveInWorkspace(ws, relPath)
+	if err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", relPath, err)
+	}
+	content := string(raw)
+	if newStr == "" && oldStr == content {
+		return "", fmt.Errorf("refusing whole-file delete through edit action for %s", relPath)
+	}
+
+	// Detect dominant line ending; normalize for matching if CRLF.
+	lineEnding := "\n"
+	if strings.Count(content, "\r\n") > strings.Count(content, "\n")-strings.Count(content, "\r\n") {
+		lineEnding = "\r\n"
+		matchContent := strings.ReplaceAll(content, "\r\n", "\n")
+		matchOld := strings.ReplaceAll(oldStr, "\r\n", "\n")
+		matchNew := strings.ReplaceAll(newStr, "\r\n", "\n")
+		count := strings.Count(matchContent, matchOld)
+		if count == 0 {
+			return "", fmt.Errorf("old_str not found in %s — file may have changed since discovery, or whitespace/line-endings don't match exactly", relPath)
+		}
+		if count > 1 {
+			return "", fmt.Errorf("old_str matches %d times in %s — must be unique; add more surrounding context", count, relPath)
+		}
+		updated := strings.Replace(matchContent, matchOld, matchNew, 1)
+		updated = strings.ReplaceAll(updated, "\n", lineEnding)
+		if err := os.WriteFile(absPath, []byte(updated), 0644); err != nil {
+			return "", fmt.Errorf("write %s: %w", relPath, err)
+		}
+		return fmt.Sprintf("edited %s (%d bytes -> %d bytes)", relPath, len(content), len(updated)), nil
+	}
+
+	count := strings.Count(content, oldStr)
+	if count == 0 {
+		return "", fmt.Errorf("old_str not found in %s — file may have changed since discovery, or whitespace/line-endings don't match exactly", relPath)
+	}
+	if count > 1 {
+		return "", fmt.Errorf("old_str matches %d times in %s — must be unique; add more surrounding context", count, relPath)
+	}
+	updated := strings.Replace(content, oldStr, newStr, 1)
+	if err := os.WriteFile(absPath, []byte(updated), 0644); err != nil {
+		return "", fmt.Errorf("write %s: %w", relPath, err)
+	}
+	return fmt.Sprintf("edited %s (%d bytes -> %d bytes)", relPath, len(content), len(updated)), nil
+}
+
+func applyCreate(ws, relPath, content string) (string, error) {
+	if len(content) > maxEditSize {
+		return "", fmt.Errorf("content exceeds %d byte cap", maxEditSize)
+	}
+	absPath, err := resolveInWorkspace(ws, relPath)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(absPath); err == nil {
+		return "", fmt.Errorf("file already exists: %s — use edit action with old_str for existing files", relPath)
+	}
+	dir := filepath.Dir(absPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	if err := os.WriteFile(absPath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("write %s: %w", relPath, err)
+	}
+	return fmt.Sprintf("created %s (%d bytes)", relPath, len(content)), nil
 }
 
 const maxShellAgentIterations = 24
@@ -623,35 +784,60 @@ func runAgenticShellJob(job transport.DispatchRequest, ws string, ctx context.Co
 		if plan.Action == "blocked" {
 			return finish(lastOutput, false, "shell planner blocked: "+plan.Reason)
 		}
-		if plan.Action != "run" || strings.TrimSpace(plan.Command) == "" {
-			return finish(lastOutput, false, "shell planner returned an invalid decision")
-		}
-		if err := validateShellCommand(plan.Command, ws); err != nil {
-			emit("shell_blocked", fmt.Sprintf("Iteration %d blocked: %v", i, err))
-			return finish(lastOutput, false, "shell planner proposed a blocked command: "+err.Error())
-		}
-		if strings.TrimSpace(plan.Command) == lastCommand {
-			repeatedCommandCount++
-		} else {
-			repeatedCommandCount = 0
-		}
-		lastCommand = strings.TrimSpace(plan.Command)
-		commandCounts[lastCommand]++
-		if repeatedCommandCount >= 2 || commandCounts[lastCommand] >= 3 {
-			return finish(lastOutput, false, fmt.Sprintf("shell planner repeated command without progress: %s", plan.Command))
-		}
 		phase := plan.Phase
 		if phase == "" {
 			phase = "discover"
 		}
-		if i > discoveryBudget && phase == "discover" && looksLikeDiscoveryCommand(plan.Command) {
-			return finish(lastOutput, false, fmt.Sprintf("planner_discovery_budget_exhausted: discovery exceeded %d iterations; next step must be edit or verify", discoveryBudget))
+		var out string
+		var ok bool
+		var errText string
+		actionLabel := plan.Action
+		switch plan.Action {
+		case "run":
+			if strings.TrimSpace(plan.Command) == "" {
+				return finish(lastOutput, false, "shell planner returned an invalid run decision")
+			}
+			if err := validateShellCommand(plan.Command, ws); err != nil {
+				emit("shell_blocked", fmt.Sprintf("Iteration %d blocked: %v", i, err))
+				return finish(lastOutput, false, "shell planner proposed a blocked command: "+err.Error())
+			}
+			if strings.TrimSpace(plan.Command) == lastCommand {
+				repeatedCommandCount++
+			} else {
+				repeatedCommandCount = 0
+			}
+			lastCommand = strings.TrimSpace(plan.Command)
+			commandCounts[lastCommand]++
+			if repeatedCommandCount >= 2 || commandCounts[lastCommand] >= 3 {
+				return finish(lastOutput, false, fmt.Sprintf("shell planner repeated command without progress: %s", plan.Command))
+			}
+			if i > discoveryBudget && phase == "discover" && looksLikeDiscoveryCommand(plan.Command) {
+				return finish(lastOutput, false, fmt.Sprintf("planner_discovery_budget_exhausted: discovery exceeded %d iterations; next step must be edit or verify", discoveryBudget))
+			}
+			emit("shell_command", fmt.Sprintf("Iteration %d [%s]: %s", i, phase, plan.Command))
+			out, ok, errText = executeAgenticShell(ctx, job, ws, plan.Command, emit)
+		case "edit":
+			emit("shell_edit", fmt.Sprintf("Iteration %d [edit]: %s", i, plan.Path))
+			result, err := applyEdit(ws, plan.Path, plan.OldStr, plan.NewStr)
+			out, ok, errText = result, err == nil, ""
+			if err != nil {
+				errText = err.Error()
+				out = "edit failed: " + errText
+			}
+		case "create":
+			emit("shell_create", fmt.Sprintf("Iteration %d [create]: %s", i, plan.Path))
+			result, err := applyCreate(ws, plan.Path, plan.Content)
+			out, ok, errText = result, err == nil, ""
+			if err != nil {
+				errText = err.Error()
+				out = "create failed: " + errText
+			}
+		default:
+			return finish(lastOutput, false, "shell planner returned an invalid decision")
 		}
-		emit("shell_command", fmt.Sprintf("Iteration %d [%s]: %s", i, phase, plan.Command))
-		out, ok, errText := executeAgenticShell(ctx, job, ws, plan.Command, emit)
 		lastOutput = out
 		plannerOutput := maybeCompressShellOutput([]byte(out))
-		transcript.WriteString(fmt.Sprintf("Iteration %d phase: %s\nCommand: %s\nExit success: %t\nOutput:\n%s\n", i, phase, plan.Command, ok, trimPlannerOutput(string(plannerOutput))))
+		transcript.WriteString(fmt.Sprintf("Iteration %d phase: %s\nAction: %s\nCommand: %s\nPath: %s\nExit success: %t\nOutput:\n%s\n", i, phase, actionLabel, plan.Command, plan.Path, ok, trimPlannerOutput(string(plannerOutput))))
 		// Keep raw worker output in streamCommand/log history; only planner context gets compacted.
 		if errText != "" {
 			transcript.WriteString("Error: " + errText + "\n")
@@ -674,10 +860,23 @@ func looksLikeDiscoveryCommand(command string) bool {
 }
 
 func planShellCommand(ctx context.Context, ws, transcript, lastOutput string) (shellPlan, error) {
-	prompt := `You are a shell task planner. Do not execute commands yourself or use tools. Choose the next single safe shell command for the worker to run. The worker may inspect files, edit files required by the task, run focused tests, and verify the result. The workspace is the command working directory; do not inspect sibling projects or parent-repository paths. Keep discovery bounded: exclude .git, vendor, node_modules, build, dist, cache, and generated directories, and cap listings/searches with head or a focused path. Once a target file has been found, STOP using rg, find, fd, ls, or repository-wide searches: inspect that file with sed/awk/head, then edit it or run a focused verification command. Never propose destructive commands such as deleting broad paths, resetting or cleaning Git, pushing changes, changing permissions broadly, or dropping databases. Return ONLY one valid JSON object matching:
-{"action":"run|complete|blocked","command":"...","reason":"...","phase":"discover|edit|verify"}
-Use action complete only when the acceptance criteria are demonstrably satisfied with evidence. Use blocked only when no safe next step exists.
+	prompt := `You are a shell task planner. Do not execute commands yourself or use tools. Choose the next single safe action for the worker. The workspace is the command working directory; do not inspect sibling projects or parent-repository paths. Keep discovery bounded: exclude .git, vendor, node_modules, build, dist, cache, and generated directories, and cap listings/searches with head or a focused path. Once a target file has been found, STOP using rg, find, fd, ls, or repository-wide searches.
 
+For FILE EDITS, prefer the native "edit" action over sed/awk/shell — it avoids cross-platform quoting issues entirely. For NEW FILES, use "create". For discovery, tests, and verification, use "run".
+
+Return ONLY one valid JSON object matching one of these shapes:
+{"action":"run","command":"...","reason":"...","phase":"discover|edit|verify"}
+{"action":"edit","path":"relative/path.ext","old_str":"exact text to find","new_str":"replacement text","reason":"..."}
+{"action":"create","path":"relative/path.ext","content":"full file content","reason":"..."}
+{"action":"complete","reason":"..."}
+{"action":"blocked","reason":"..."}
+
+Rules:
+- edit: path must be relative to workspace. old_str must match exactly once in the file (include enough surrounding context for uniqueness). No regex, no shell escaping.
+- create: path must be relative. Fails if file already exists.
+- run: use only for discovery, testing, and verification — never for file edits.
+- complete: only when acceptance criteria are demonstrably satisfied with evidence.
+- blocked: only when no safe next step exists.
 ` + transcript
 	if lastOutput != "" {
 		prompt += "\nLatest worker output:\n" + trimPlannerOutput(lastOutput)
@@ -744,11 +943,27 @@ func parseShellPlan(raw string) (shellPlan, error) {
 	}
 	plan.Action = strings.ToLower(strings.TrimSpace(plan.Action))
 	plan.Phase = strings.ToLower(strings.TrimSpace(plan.Phase))
-	if plan.Action != "run" && plan.Action != "complete" && plan.Action != "blocked" {
+	if plan.Action != "run" && plan.Action != "complete" && plan.Action != "blocked" && plan.Action != "edit" && plan.Action != "create" {
 		return shellPlan{}, fmt.Errorf("invalid planner action %q", plan.Action)
 	}
 	if plan.Action == "run" && strings.TrimSpace(plan.Command) == "" {
 		return shellPlan{}, fmt.Errorf("run action requires command")
+	}
+	if plan.Action == "edit" {
+		if strings.TrimSpace(plan.Path) == "" {
+			return shellPlan{}, fmt.Errorf("edit action requires path")
+		}
+		if plan.OldStr == "" {
+			return shellPlan{}, fmt.Errorf("edit action requires old_str")
+		}
+	}
+	if plan.Action == "create" {
+		if strings.TrimSpace(plan.Path) == "" {
+			return shellPlan{}, fmt.Errorf("create action requires path")
+		}
+		if plan.Content == "" {
+			return shellPlan{}, fmt.Errorf("create action requires content")
+		}
 	}
 	if plan.Phase != "" && plan.Phase != "discover" && plan.Phase != "edit" && plan.Phase != "verify" {
 		return shellPlan{}, fmt.Errorf("invalid planner phase %q", plan.Phase)
@@ -840,6 +1055,12 @@ func validateShellCommand(command, workspace string) error {
 		if strings.ContainsAny(token, "|{}") {
 			continue
 		}
+		// Slash-delimited search/awk regexes such as /[.]js$/ or /^api\// are
+		// expressions, not filesystem paths. Abs check would treat them as
+		// absolute paths and block them. Real paths never contain regex chars.
+		if strings.HasPrefix(token, "/") && strings.ContainsAny(token, "[]$*+?^\\") {
+			continue
+		}
 		if token == ".." || strings.HasPrefix(token, "../") || strings.Contains(token, "/../") {
 			return fmt.Errorf("path traversal blocked: %s", token)
 		}
@@ -876,6 +1097,7 @@ func detectExecutors() ([]string, map[string]string) {
 		bins []string
 	}{
 		{"hermes", []string{"hermes"}}, {"codex", []string{"codex"}},
+		{"dsh", []string{"dsh"}},
 		{"commandcode", []string{"cmd", "cmdc", "command-code"}},
 	}
 	var out []string
@@ -1001,6 +1223,23 @@ func rewriteShellCmd(raw string) string {
 	return raw
 }
 
+func validateDSHBinary(bin string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("binary health check timed out (DSH Web/Harness may be unavailable)")
+	}
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("binary health check failed: %s", msg)
+	}
+	return nil
+}
+
 func findBin(name string) string {
 	for _, p := range []string{os.ExpandEnv("$HOME/.local/bin/" + name), "/opt/homebrew/bin/" + name, "/usr/local/bin/" + name} {
 		if _, err := os.Stat(p); err == nil {
@@ -1016,6 +1255,9 @@ func findBin(name string) string {
 func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
 	stdoutCh := make(chan []byte, 64)
 	stderrCh := make(chan []byte, 64)
 	go func() {
@@ -1048,9 +1290,6 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 			}
 		}
 	}()
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
 	var out []byte
 	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
@@ -1062,9 +1301,6 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 		_ = postJSON(nodeAgentBase()+"/api/nodes/progress", transport.ProgressRequest{TaskID: taskID, Chunk: string(pending)})
 		pending = nil
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	waitErr := error(nil)
 	stdoutOpen, stderrOpen := true, true
 	for stdoutOpen || stderrOpen || pending != nil {
 		select {
@@ -1084,39 +1320,125 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 			pending = append(pending, chunk...)
 		case <-ticker.C:
 			flush()
-		case waitErr = <-done:
-			// pump remaining after process exit before leaving
-			for {
-				select {
-				case chunk, ok := <-stdoutCh:
-					if !ok {
-						stdoutOpen = false
-						break
-					}
-					out = append(out, chunk...)
-					pending = append(pending, chunk...)
-					continue
-				case chunk, ok := <-stderrCh:
-					if !ok {
-						stderrOpen = false
-						break
-					}
-					out = append(out, chunk...)
-					pending = append(pending, chunk...)
-					continue
-				default:
-				}
-				break
-			}
-			flush()
-			stdoutOpen, stderrOpen = false, false
-		}
-		if waitErr != nil && !stdoutOpen && !stderrOpen {
-			break
 		}
 	}
 	flush()
+	waitErr := cmd.Wait()
 	return out, waitErr
+}
+
+func registerDeepSeekHarnessWorkspace(workspacePath, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(workspacePath) == "" {
+		return fmt.Errorf("dsh workspace registration requires workspace and session")
+	}
+	canonicalPath, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return fmt.Errorf("canonicalize workspace: %w", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home: %w", err)
+	}
+	path := filepath.Join(home, ".dsh", "storages", "workspace.json")
+	dshWorkspaceMu.Lock()
+	defer dshWorkspaceMu.Unlock()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read workspace registry: %w", err)
+	}
+	var storage dshWorkspaceStorage
+	if err := json.Unmarshal(raw, &storage); err != nil {
+		return fmt.Errorf("decode workspace registry: %w", err)
+	}
+	if storage.Tables.Workspaces == nil {
+		storage.Tables.Workspaces = map[string]dshWorkspace{}
+	}
+	var workspaceID string
+	for id, workspace := range storage.Tables.Workspaces {
+		storedPath, pathErr := filepath.EvalSymlinks(workspace.Path)
+		if pathErr == nil && storedPath == canonicalPath {
+			workspaceID = id
+			if !containsString(workspace.SessionIDs, sessionID) {
+				workspace.SessionIDs = append([]string{sessionID}, workspace.SessionIDs...)
+			}
+			workspace.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			storage.Tables.Workspaces[id] = workspace
+			break
+		}
+	}
+	if workspaceID == "" {
+		workspaceID, err = newUUID()
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		storage.Tables.Workspaces[workspaceID] = dshWorkspace{
+			Path: canonicalPath, Title: filepath.Base(canonicalPath),
+			SessionIDs: []string{sessionID}, CreatedAt: now, UpdatedAt: now,
+		}
+		ids, _ := storage.Global["workspaceIds"].([]any)
+		storage.Global["workspaceIds"] = append([]any{workspaceID}, ids...)
+	}
+	updated, err := json.MarshalIndent(storage, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode workspace registry: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(updated, '\n'), 0644); err != nil {
+		return fmt.Errorf("write workspace registry: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("commit workspace registry: %w", err)
+	}
+	return nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func newUUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]), hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16])), nil
+}
+
+func deepSeekHarnessArgs(sessionID string) []string {
+	args := []string{"--profile", "headless", "--json"}
+	if strings.TrimSpace(sessionID) != "" {
+		args = append(args, "--session-id", strings.TrimSpace(sessionID))
+	}
+	return args
+}
+
+var dshSessionEventRE = regexp.MustCompile(`\"type\"\s*:\s*\"session\"[^{\n}]*\"sessionId\"\s*:\s*\"([^\"]+)\"(?:[^{}\n]*\"cwd\"\s*:\s*\"([^\"]*)\")?`)
+
+func parseDeepSeekHarnessSessionEvent(raw []byte) (string, string) {
+	text := string(raw)
+	for _, line := range strings.Split(text, "\n") {
+		var event struct {
+			Type      string `json:"type"`
+			SessionID string `json:"sessionId"`
+			CWD       string `json:"cwd"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &event) == nil && event.Type == "session" && event.SessionID != "" {
+			return event.SessionID, event.CWD
+		}
+	}
+	if match := dshSessionEventRE.FindStringSubmatch(text); len(match) > 1 {
+		return match[1], match[2]
+	}
+	return "", ""
 }
 
 func nodeAgentBase() string {
