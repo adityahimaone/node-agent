@@ -168,7 +168,7 @@ func main() {
 		dur := time.Since(start).Milliseconds()
 		atomic.StoreInt32(&busy, 0)
 
-		res := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: dur}
+		res := dshResult(job, output, ok, errStr, dur)
 		if err := postJSON(server+"/api/nodes/"+nodeID+"/result", res); err != nil {
 			log.Printf("result post err: %v", err)
 		}
@@ -251,14 +251,15 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runJobWithProgress(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+		output, ok, errStr := runJobWithProgress(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
 		})
 		dur := time.Since(start).Milliseconds()
 		atomic.StoreInt32(&busy, 0)
-		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: dur}}); err != nil {
+		res := dshResult(transport.DispatchRequest{TaskID: job.TaskID, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq}, output, ok, errStr, dur)
+		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: res.TaskID, Success: res.Success, Output: res.Output, Error: res.Error, DurationMs: res.DurationMs, DSHSessionID: res.DSHSessionID, DSHWorkspaceID: res.DSHWorkspaceID, LastTurnSeq: res.LastTurnSeq}}); err != nil {
 			return err
 		}
 		_ = stream.Send(&transport.WorkerFrame{Heartbeat: &transport.HeartbeatFrame{NodeID: nodeID, Status: "idle"}})
@@ -531,7 +532,7 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 		resolvedArgs = deepSeekHarnessArgs(job.DSHSessionID)
 		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
 		// launchd PATH omits Homebrew; dsh's shebang resolves node through env.
-		cmd.Env = append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:"+os.Getenv("PATH"))
+		cmd.Env = dshCommandEnv()
 		if strings.TrimSpace(job.Model) != "" {
 			cmd.Env = append(cmd.Env, "DSH_MODEL="+strings.TrimSpace(job.Model))
 		}
@@ -566,6 +567,13 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 	emit("process_spawned", "Starting agent process")
 	out, err := streamCommand(cmd, job.TaskID)
 	emit("process_exited", "Agent process finished")
+	if executor == "dsh" && strings.TrimSpace(job.DSHSessionID) != "" && dshSessionWriteHandleConflict(out) {
+		// A crashed or concurrently running DSH process can leave the resumed
+		// session owned by a write handle. Retrying the continuation with a new
+		// session preserves the task prompt while avoiding the poisoned lock.
+		job.DSHSessionID = ""
+		return runJobWithProgress(job, onProgress)
+	}
 	// ponytail: shell caveman gated behind NODE_AGENT_SHELL_CAVEMAN=1; compress tail only when payload >8k and LLM path available
 	if executor == "shell" && os.Getenv("NODE_AGENT_SHELL_CAVEMAN") == "1" {
 		out = maybeCompressShellOutput(out)
@@ -613,6 +621,33 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 		return string(out), false, err.Error()
 	}
 	return string(out), true, ""
+}
+
+func dshResult(job transport.DispatchRequest, output string, ok bool, errStr string, durationMs int64) transport.ResultRequest {
+	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq}
+	if result.DSHWorkspaceID == "" && job.Executor == "dsh" {
+		result.DSHWorkspaceID = dshWorkspaceID(job.Workspace)
+	}
+	if job.Executor != "dsh" {
+		return result
+	}
+	if sessionID, _ := parseDeepSeekHarnessSessionEvent([]byte(output)); sessionID != "" {
+		result.DSHSessionID = sessionID
+	}
+	if result.LastTurnSeq == nil {
+		seq := int64(0)
+		result.LastTurnSeq = &seq
+	} else if ok {
+		seq := *result.LastTurnSeq + 1
+		result.LastTurnSeq = &seq
+	}
+	return result
+}
+
+func dshSessionWriteHandleConflict(output []byte) bool {
+	text := strings.ToLower(string(output))
+	return strings.Contains(text, "already owned by an active write handle") ||
+		strings.Contains(text, "active write handle")
 }
 
 type shellPlan struct {
@@ -1106,7 +1141,11 @@ func detectExecutors() ([]string, map[string]string) {
 		if bin := findBinAny(c.bins...); bin != "" {
 			out = append(out, c.name)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			b, _ := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+			cmd := exec.CommandContext(ctx, bin, "--version")
+			if c.name == "dsh" {
+				cmd.Env = dshCommandEnv()
+			}
+			b, _ := cmd.CombinedOutput()
 			cancel()
 			versions[c.name] = strings.TrimSpace(string(b))
 		}
@@ -1226,8 +1265,18 @@ func rewriteShellCmd(raw string) string {
 func validateDSHBinary(bin string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	cmd := exec.CommandContext(ctx, bin, "--version")
+	// launchd starts the worker with a minimal PATH. dsh is a Node launcher,
+	// so its health check must use the same Homebrew PATH as the real run.
+	cmd.Env = dshCommandEnv()
+	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
+		if dshWebAvailable() {
+			// Some DSH versions boot the plugin tree even for --version and can
+			// exceed this probe timeout while the already-running web profile is
+			// healthy. Let the real bounded headless invocation decide instead.
+			return nil
+		}
 		return fmt.Errorf("binary health check timed out (DSH Web/Harness may be unavailable)")
 	}
 	if err != nil {
@@ -1238,6 +1287,29 @@ func validateDSHBinary(bin string) error {
 		return fmt.Errorf("binary health check failed: %s", msg)
 	}
 	return nil
+}
+
+func dshWebAvailable() bool {
+	url := strings.TrimSpace(os.Getenv("NODE_AGENT_DSH_WEB_URL"))
+	if url == "" {
+		url = "http://127.0.0.1:3080/"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := (&http.Client{Timeout: 1500 * time.Millisecond}).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 500
+}
+
+func dshCommandEnv() []string {
+	return append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:"+os.Getenv("PATH"))
 }
 
 func findBin(name string) string {
@@ -1325,6 +1397,32 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 	flush()
 	waitErr := cmd.Wait()
 	return out, waitErr
+}
+
+func dshWorkspaceID(workspacePath string) string {
+	canonicalPath, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".dsh", "storages", "workspace.json"))
+	if err != nil {
+		return ""
+	}
+	var storage dshWorkspaceStorage
+	if json.Unmarshal(raw, &storage) != nil {
+		return ""
+	}
+	for id, workspace := range storage.Tables.Workspaces {
+		storedPath, pathErr := filepath.EvalSymlinks(workspace.Path)
+		if pathErr == nil && storedPath == canonicalPath {
+			return id
+		}
+	}
+	return ""
 }
 
 func registerDeepSeekHarnessWorkspace(workspacePath, sessionID string) error {

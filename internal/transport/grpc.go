@@ -34,12 +34,15 @@ type JobProgress struct {
 	Message    string `json:"message"`
 }
 type JobResult struct {
-	DeliveryID string `json:"delivery_id"`
-	TaskID     string `json:"task_id"`
-	Success    bool   `json:"success"`
-	Output     string `json:"output"`
-	Error      string `json:"error,omitempty"`
-	DurationMs int64  `json:"duration_ms"`
+	DeliveryID     string `json:"delivery_id"`
+	TaskID         string `json:"task_id"`
+	Success        bool   `json:"success"`
+	Output         string `json:"output"`
+	Error          string `json:"error,omitempty"`
+	DurationMs     int64  `json:"duration_ms"`
+	DSHSessionID   string `json:"dsh_session_id,omitempty"`
+	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
+	LastTurnSeq    *int64 `json:"last_turn_seq,omitempty"`
 }
 type WorkerFrame struct {
 	Register    *RegisterFrame  `json:"register,omitempty"`
@@ -69,6 +72,11 @@ type DispatchJob struct {
 	Provider             string `json:"provider"`
 	PrequestNote         string `json:"prequest_note"`
 	DSHSessionID         string `json:"dsh_session_id,omitempty"`
+	DSHWorkspaceID       string `json:"dsh_workspace_id,omitempty"`
+	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
+	LastCommentID        *int64 `json:"last_comment_id,omitempty"`
+	RunID                string `json:"run_id,omitempty"`
+	SessionContinuation  bool   `json:"session_continuation,omitempty"`
 	LeaseExpiresAtUnixMs int64  `json:"lease_expires_at_unix_ms"`
 	// Persistent chat fields. ConversationID empty => server/agent auto-resolves
 	// per workspace. AppendOnly=false means reset context before this message.

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,6 +102,34 @@ func TestValidateDSHBinaryRejectsFailingBinary(t *testing.T) {
 	}
 	if err := validateDSHBinary(bin); err == nil || !strings.Contains(err.Error(), "binary health check failed") {
 		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
+func TestDSHCommandEnvIncludesHomebrewNodePaths(t *testing.T) {
+	t.Setenv("PATH", "/test/bin")
+	env := strings.Join(dshCommandEnv(), "\n")
+	if !strings.Contains(env, "PATH=/opt/homebrew/bin:/usr/local/bin:/test/bin") {
+		t.Fatalf("dsh environment does not include launchd-safe Node paths: %s", env)
+	}
+}
+
+func TestDSHWebAvailableUsesConfiguredEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("NODE_AGENT_DSH_WEB_URL", server.URL)
+	if !dshWebAvailable() {
+		t.Fatal("expected configured DSH web endpoint to be reachable")
+	}
+}
+
+func TestDSHSessionWriteHandleConflict(t *testing.T) {
+	if !dshSessionWriteHandleConflict([]byte(`dsh: session "abc" is already owned by an active write handle`)) {
+		t.Fatal("expected active write handle conflict to be detected")
+	}
+	if dshSessionWriteHandleConflict([]byte(`dsh: request completed`)) {
+		t.Fatal("did not expect ordinary DSH output to be treated as a session conflict")
 	}
 }
 

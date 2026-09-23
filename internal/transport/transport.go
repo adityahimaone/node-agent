@@ -43,7 +43,12 @@ type DispatchRequest struct {
 	// by the server from workspaces.json Note — prepended to the agent prompt.
 	PrequestNote string `json:"prequest_note,omitempty"`
 	// DSHSessionID resumes same DeepSeek Harness session for task comments.
-	DSHSessionID string `json:"dsh_session_id,omitempty"`
+	DSHSessionID        string `json:"dsh_session_id,omitempty"`
+	DSHWorkspaceID      string `json:"dsh_workspace_id,omitempty"`
+	LastTurnSeq         *int64 `json:"last_turn_seq,omitempty"`
+	LastCommentID       *int64 `json:"last_comment_id,omitempty"`
+	RunID               string `json:"run_id,omitempty"`
+	SessionContinuation bool   `json:"session_continuation,omitempty"`
 	// Persistent chat. ConversationID empty => server/agent auto-resolves per
 	// workspace. AppendOnly=false means reset context before this message.
 	ConversationID string `json:"conversation_id,omitempty"`
@@ -59,11 +64,14 @@ type ProgressRequest struct {
 
 // Result — agent -> server
 type ResultRequest struct {
-	TaskID     string `json:"task_id"`
-	Success    bool   `json:"success"`
-	Output     string `json:"output"`
-	Error      string `json:"error,omitempty"`
-	DurationMs int64  `json:"duration_ms"`
+	TaskID         string `json:"task_id"`
+	Success        bool   `json:"success"`
+	Output         string `json:"output"`
+	Error          string `json:"error,omitempty"`
+	DurationMs     int64  `json:"duration_ms"`
+	DSHSessionID   string `json:"dsh_session_id,omitempty"`
+	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
+	LastTurnSeq    *int64 `json:"last_turn_seq,omitempty"`
 }
 
 func WriteJSON(w http.ResponseWriter, code int, v any) {
