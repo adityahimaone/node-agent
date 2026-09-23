@@ -410,10 +410,16 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 }
 
 func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, string)) (output string, ok bool, errStr string) {
-	maxDSHConflictRetries := 15
+	maxDSHConflictRetries := 30
 	if raw := strings.TrimSpace(os.Getenv("NODE_AGENT_DSH_CONFLICT_RETRIES")); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			maxDSHConflictRetries = parsed
+		}
+	}
+	conflictRetryDelay := 1 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("NODE_AGENT_DSH_CONFLICT_DELAY_MS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			conflictRetryDelay = time.Duration(parsed) * time.Millisecond
 		}
 	}
 	for attempt := 0; ; attempt++ {
@@ -426,7 +432,7 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 		}
 		// DSH write handles can outlive a short-lived CLI process. Retry same
 		// session only; never clear ID or create a new session.
-		time.Sleep(750 * time.Millisecond)
+		time.Sleep(conflictRetryDelay)
 	}
 }
 
