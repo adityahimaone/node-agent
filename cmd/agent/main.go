@@ -399,6 +399,27 @@ func runJob(job transport.DispatchRequest) (output string, ok bool, errStr strin
 }
 
 func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, string)) (output string, ok bool, errStr string) {
+	maxDSHConflictRetries := 15
+	if raw := strings.TrimSpace(os.Getenv("NODE_AGENT_DSH_CONFLICT_RETRIES")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			maxDSHConflictRetries = parsed
+		}
+	}
+	for attempt := 0; ; attempt++ {
+		output, ok, errStr = runJobWithProgressAttempt(job, onProgress)
+		if !strings.HasPrefix(errStr, "dsh_session_conflict_retry:") {
+			return output, ok, errStr
+		}
+		if attempt >= maxDSHConflictRetries {
+			return output, false, "dsh_session_conflict: " + strings.TrimPrefix(errStr, "dsh_session_conflict_retry: ")
+		}
+		// DSH write handles can outlive a short-lived CLI process. Retry same
+		// session only; never clear ID or create a new session.
+		time.Sleep(750 * time.Millisecond)
+	}
+}
+
+func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(string, string)) (output string, ok bool, errStr string) {
 	emit := func(phase, message string) {
 		if onProgress != nil {
 			onProgress(phase, message)
@@ -570,7 +591,7 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 	if executor == "dsh" && strings.TrimSpace(job.DSHSessionID) != "" && dshSessionWriteHandleConflict(out) {
 		// Never downgrade a continuation to a cold session. The control plane
 		// binds result identity to the dispatched session and must reject a new ID.
-		return string(out), false, "dsh_session_conflict: existing session is owned by an active write handle"
+		return string(out), false, "dsh_session_conflict_retry: existing session is owned by an active write handle"
 	}
 	// ponytail: shell caveman gated behind NODE_AGENT_SHELL_CAVEMAN=1; compress tail only when payload >8k and LLM path available
 	if executor == "shell" && os.Getenv("NODE_AGENT_SHELL_CAVEMAN") == "1" {

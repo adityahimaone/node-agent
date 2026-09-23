@@ -143,6 +143,7 @@ func TestRunJobDSHConflictDoesNotCreateNewSession(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir)
 	t.Setenv("DSH_COUNT", count)
+	t.Setenv("NODE_AGENT_DSH_CONFLICT_RETRIES", "2")
 	_, ok, errStr := runJob(transport.DispatchRequest{TaskID: "t-dsh-conflict", Workspace: ws, Executor: "dsh", DSHSessionID: "session-existing", Message: "continue task"})
 	if ok {
 		t.Fatal("write-handle conflict must fail continuation")
@@ -155,7 +156,7 @@ func TestRunJobDSHConflictDoesNotCreateNewSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(invocations)
-	if strings.Count(got, "--profile headless --json") != 1 || strings.Count(got, "--session-id session-existing") != 1 {
+	if strings.Count(got, "--profile headless --json") != 3 || strings.Count(got, "--session-id session-existing") != 3 {
 		t.Fatalf("continuation retry changed session identity, invocations=%q", invocations)
 	}
 }
