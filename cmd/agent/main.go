@@ -568,11 +568,9 @@ func runJobWithProgress(job transport.DispatchRequest, onProgress func(string, s
 	out, err := streamCommand(cmd, job.TaskID)
 	emit("process_exited", "Agent process finished")
 	if executor == "dsh" && strings.TrimSpace(job.DSHSessionID) != "" && dshSessionWriteHandleConflict(out) {
-		// A crashed or concurrently running DSH process can leave the resumed
-		// session owned by a write handle. Retrying the continuation with a new
-		// session preserves the task prompt while avoiding the poisoned lock.
-		job.DSHSessionID = ""
-		return runJobWithProgress(job, onProgress)
+		// Never downgrade a continuation to a cold session. The control plane
+		// binds result identity to the dispatched session and must reject a new ID.
+		return string(out), false, "dsh_session_conflict: existing session is owned by an active write handle"
 	}
 	// ponytail: shell caveman gated behind NODE_AGENT_SHELL_CAVEMAN=1; compress tail only when payload >8k and LLM path available
 	if executor == "shell" && os.Getenv("NODE_AGENT_SHELL_CAVEMAN") == "1" {

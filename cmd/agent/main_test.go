@@ -133,6 +133,33 @@ func TestDSHSessionWriteHandleConflict(t *testing.T) {
 	}
 }
 
+func TestRunJobDSHConflictDoesNotCreateNewSession(t *testing.T) {
+	ws := mustTempDir(t)
+	binDir := t.TempDir()
+	bin := filepath.Join(binDir, "dsh")
+	count := filepath.Join(ws, "invocations")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DSH_COUNT\"\nprintf 'dsh: session \\\"session-existing\\\" is already owned by an active write handle\\n'"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	t.Setenv("DSH_COUNT", count)
+	_, ok, errStr := runJob(transport.DispatchRequest{TaskID: "t-dsh-conflict", Workspace: ws, Executor: "dsh", DSHSessionID: "session-existing", Message: "continue task"})
+	if ok {
+		t.Fatal("write-handle conflict must fail continuation")
+	}
+	if !strings.Contains(errStr, "dsh_session_conflict") {
+		t.Fatalf("err=%q, want dsh_session_conflict", errStr)
+	}
+	invocations, err := os.ReadFile(count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(invocations)
+	if strings.Count(got, "--profile headless --json") != 1 || strings.Count(got, "--session-id session-existing") != 1 {
+		t.Fatalf("continuation retry changed session identity, invocations=%q", invocations)
+	}
+}
+
 func TestRunJobDeepSeekHarnessResumesExistingSession(t *testing.T) {
 	ws := mustTempDir(t)
 	binDir := t.TempDir()
