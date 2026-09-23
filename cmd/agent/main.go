@@ -63,6 +63,17 @@ type dshWorkspace struct {
 // Status:"idle" on every tick regardless of whether a job was running,
 // so a long-running hermes/codex job could get reported as idle mid-flight.
 var busy int32
+var dshSessionLocks sync.Map // session ID -> *sync.Mutex
+
+func runExclusiveJob(job transport.DispatchRequest, onProgress func(string, string)) (string, bool, string) {
+	if strings.EqualFold(strings.TrimSpace(job.Executor), "dsh") && strings.TrimSpace(job.DSHSessionID) != "" {
+		value, _ := dshSessionLocks.LoadOrStore(job.DSHSessionID, &sync.Mutex{})
+		lock := value.(*sync.Mutex)
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	return runJobWithProgress(job, onProgress)
+}
 
 func main() {
 	server := os.Getenv("NODE_AGENT_SERVER")
@@ -161,7 +172,7 @@ func main() {
 		atomic.StoreInt32(&busy, 1)
 		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: "busy"})
 		start := time.Now()
-		output, ok, errStr := runJobWithProgress(job, func(phase, message string) {
+		output, ok, errStr := runExclusiveJob(job, func(phase, message string) {
 			marker, _ := json.Marshal(map[string]string{"phase": phase, "label": message})
 			_ = postJSON(server+"/api/nodes/progress", transport.ProgressRequest{TaskID: job.TaskID, Chunk: "HERMES_EVENT: " + string(marker) + "\n"})
 		})
@@ -251,7 +262,7 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runJobWithProgress(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
