@@ -157,13 +157,13 @@ func TestDSHWebLaunchTokenEmptyMissing(t *testing.T) {
 	if _, err := dshWebLaunchToken(); err == nil {
 		t.Fatal("expected error for web.log without token")
 	}
-	// valid token parses
+	// valid token parses; multiple banners -> last token wins (rotation)
 	if err := os.WriteFile(filepath.Join(home, ".dsh", "web.log"),
-		[]byte("token=abc123\n"), 0o600); err != nil {
+		[]byte("token=aaaa1111\ndsh web: token=bbb2222\ndsh web: http://127.0.0.1:3080/?token=ccc3333\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tok, err := dshWebLaunchToken()
-	if err != nil || tok != "abc123" {
-		t.Fatalf("token=%q err=%v want abc123", tok, err)
+	if err != nil || tok != "ccc3333" {
+		t.Fatalf("token=%q err=%v want ccc3333 (last wins)", tok, err)
 	}
 }

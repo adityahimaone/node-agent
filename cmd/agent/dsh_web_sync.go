@@ -66,11 +66,13 @@ func dshWebLaunchToken() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
 	}
-	m := dshLaunchTokenRe.FindSubmatch(raw)
-	if m == nil {
+	m := dshLaunchTokenRe.FindAllSubmatch(raw, -1)
+	if len(m) == 0 {
 		return "", fmt.Errorf("no launch token in %s (daemon possibly not started)", path)
 	}
-	return string(m[1]), nil
+	// web.log accumulates one banner per daemon start; only the LAST token is
+	// valid (the daemon rotates the secret each launch).
+	return string(m[len(m)-1][1]), nil
 }
 
 // dshCookieName returns the per-authority cookie name
