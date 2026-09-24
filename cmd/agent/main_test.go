@@ -276,6 +276,24 @@ func TestPublishSessionToLegacyHomeKeepsWebVisibleCopy(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, ".dsh", "sessions", relDir, sid, "session.lock")); !os.IsNotExist(err) {
 		t.Fatal("published session carried the lock file; isolation would break")
 	}
+	// The UI lists sessions from the registry, so publishing must register too.
+	raw, err := os.ReadFile(filepath.Join(home, ".dsh", "storages", "workspace.json"))
+	if err != nil {
+		t.Fatalf("legacy registry not written: %v", err)
+	}
+	var storage dshWorkspaceStorage
+	if err := json.Unmarshal(raw, &storage); err != nil {
+		t.Fatalf("legacy registry unreadable: %v", err)
+	}
+	listed := false
+	for _, w := range storage.Tables.Workspaces {
+		if containsString(w.SessionIDs, sid) {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatal("published session is absent from the legacy registry; the web UI would not list it")
+	}
 }
 
 func TestPublishSessionToLegacyHomeNeverOverwritesNewerTranscript(t *testing.T) {

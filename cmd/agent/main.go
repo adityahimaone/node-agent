@@ -1555,6 +1555,14 @@ func publishSessionToLegacyHome(sessionID, workspacePath string) bool {
 	}
 	// The copied lock file is meaningless (and misleading) in the target home.
 	_ = os.Remove(filepath.Join(dst, "session.lock"))
+	// The UI enumerates sessions from the registry, so listing the transcript is
+	// not enough: register it there too, or the session stays invisible.
+	if err := registerDSHWorkspaceInRegistry(
+		filepath.Join(home, ".dsh", "storages", "workspace.json"), canonical, sessionID,
+	); err != nil {
+		log.Printf("dsh session publish %s: registry: %v (web UI may not list this session)", sessionID, err)
+		return false
+	}
 	log.Printf("dsh session publish: mirrored session %s to %s", sessionID, dst)
 	return true
 }
@@ -1680,6 +1688,18 @@ func dshWorkspaceID(workspacePath string) string {
 }
 
 func registerDeepSeekHarnessWorkspace(workspacePath, sessionID string) error {
+	path := dshWorkspaceRegistryPath()
+	if path == "" {
+		return fmt.Errorf("resolve dsh home: no usable DSH_HOME")
+	}
+	return registerDSHWorkspaceInRegistry(path, workspacePath, sessionID)
+}
+
+// registerDSHWorkspaceInRegistry adds a session to the workspace registry at
+// `path`, creating both the registry and the entry when absent. Called for the
+// agent's isolated home and, on publish, for the user's ~/.dsh registry — the
+// `dsh web` UI enumerates sessions from there, not from the session directory.
+func registerDSHWorkspaceInRegistry(path, workspacePath, sessionID string) error {
 	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(workspacePath) == "" {
 		return fmt.Errorf("dsh workspace registration requires workspace and session")
 	}
@@ -1687,7 +1707,6 @@ func registerDeepSeekHarnessWorkspace(workspacePath, sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("canonicalize workspace: %w", err)
 	}
-	path := dshWorkspaceRegistryPath()
 	if path == "" {
 		return fmt.Errorf("resolve dsh home: no usable DSH_HOME")
 	}
