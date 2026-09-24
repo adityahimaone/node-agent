@@ -192,7 +192,9 @@ func dshMintCookie(ctx context.Context, client *http.Client, token string) (stri
 
 // syncDSHWebSession makes the daemon see `sessionID` under the workspace for
 // `workspacePath`, the same way the web UI would create it. Soft-fail: returns
-// error for logging; callers ignore it for dispatch success.
+// error for logging; callers ignore it for dispatch success. Retries once on
+// any error — a daemon briefly busy (e.g. while the dsh runner hammers the
+// web endpoint during session exploration) times out on the first attempt.
 func syncDSHWebSession(ctx context.Context, sessionID, workspacePath string) error {
 	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(workspacePath) == "" {
 		return fmt.Errorf("sync requires session id and workspace path")
@@ -200,7 +202,20 @@ func syncDSHWebSession(ctx context.Context, sessionID, workspacePath string) err
 	if os.Getenv("NODE_AGENT_DSH_RPC_SYNC") == "0" {
 		return nil
 	}
-	client := &http.Client{Timeout: 8 * time.Second}
+	if err := syncDSHWebSessionOnce(ctx, sessionID, workspacePath); err == nil {
+		return nil
+	} else {
+		// One retry, then give up (soft).
+		if retryErr := syncDSHWebSessionOnce(ctx, sessionID, workspacePath); retryErr == nil {
+			return nil
+		} else {
+			return fmt.Errorf("sync failed (initial: %v; retry: %v)", err, retryErr)
+		}
+	}
+}
+
+func syncDSHWebSessionOnce(ctx context.Context, sessionID, workspacePath string) error {
+	client := &http.Client{Timeout: 15 * time.Second}
 
 	// 1. Ensure the workspace exists in the daemon (idempotent by path).
 	wsValue, err := dshWebRPC(ctx, client, "workspace/create",
