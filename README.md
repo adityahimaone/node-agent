@@ -42,8 +42,8 @@ The server keeps the queue and results in memory. An agent registers, sends hear
 |---|---|---|---|
 | `hermes` | `hermes` | `hermes chat -q` | Uses `HERMES_WORKSPACE` |
 | `codex` | `codex` | `codex exec --full-auto` | Non-interactive coding tasks |
-| `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
 | `dsh` | `dsh` | `--profile headless --json` | DeepSeek Harness session; isolated `DSH_HOME` |
+| `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
 | `shell` | OS shell | `bash -lc` or `cmd /c` | `command` only; `body` is description — empty `command` rejected |
 | `auto` | Available capability | Hermes, then Codex, then CommandCode | Compatibility mode |
 
@@ -98,7 +98,7 @@ At startup the agent finds available binaries and sends capabilities:
   "hostname": "worker-mac",
   "version": "0.3.0",
   "workspaces": ["/Users/<user>/Development"],
-  "executors": ["hermes", "codex", "commandcode", "dsh", "shell"],
+  "executors": ["hermes", "codex", "dsh", "commandcode", "shell"],
   "versions": {"commandcode": "..."}
 }
 ```
