@@ -92,6 +92,44 @@ loop 3  remote_dispatched 1790218627 -> completed 1790218735  error=""
   `dsh web` PID 198 still held 18 legacy locks throughout
 - `workspace_transport=node-agent` (not downgraded to `ssh`)
 
+## Agent sessions are invisible in the `dsh web` UI
+
+Symptom: agent runs complete fine, but `dsh web` lists none of their sessions.
+
+Cause, in layers:
+
+1. `dsh web` resolves its home with `resolveDshHome()` → `homedir()/.dsh` unless
+   `DSH_HOME` is set. Agent-dispatched runs set `DSH_HOME` to the isolated home,
+   so the two processes read disjoint session stores.
+2. Mirroring the transcript into `~/.dsh` is **not** enough. The UI enumerates
+   sessions from `$DSH_HOME/storages/workspace.json` (`tables.workspaces[*].sessionIds`),
+   not from the sessions directory. A session with a valid transcript but no
+   registry entry stays invisible.
+
+Fix: after a successful `dsh` run, `publishSessionToLegacyHome` copies the
+session directory into `~/.dsh` and registers the session in the legacy
+workspace registry (`registerDSHWorkspaceInRegistry`). Opt out with
+`NODE_AGENT_DSH_PUBLISH=0`.
+
+Rules the publish path must keep:
+
+- **Never copy `session.lock`.** Sharing that inode hands the daemon's
+  non-expiring `flock(2)` back to the agent and reintroduces the original
+  conflict. The lock file is removed from the destination after copying.
+- **Compare the newest file's mtime, not the directory's.** Continuations
+  append to the same transcript in place, leaving the parent directory mtime
+  unchanged. A directory-mtime check makes the first publish look permanently
+  current and later loops never refresh — the UI then shows a frozen
+  transcript while the agent keeps working.
+- **Never overwrite a strictly newer published transcript.** The daemon may
+  have advanced the session in the web UI; rolling it back loses that work.
+
+Verify a publish with: published transcript byte size equals the isolated one,
+and `sessionIds` in `~/.dsh/storages/workspace.json` contains the session. The
+daemon only keeps a `~/.dsh` lock while it holds a session open, so that lock
+may legitimately be absent; what must never happen is the two homes sharing one
+lock inode.
+
 ## Four-loop result (card `t_54e3ba28`)
 
 Second run against a fresh card, four loops, same isolated-home binary.
