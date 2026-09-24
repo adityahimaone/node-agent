@@ -43,6 +43,43 @@ func TestParseDeepSeekHarnessSessionEvent(t *testing.T) {
 	}
 }
 
+func TestEnsureDeepSeekHarnessWorkspaceCreatesAndReusesByCanonicalPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+	ws := mustTempDir(t)
+
+	id1, err := ensureDSHWorkspace(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 == "" {
+		t.Fatal("workspace id is empty")
+	}
+	id2, err := ensureDSHWorkspace(filepath.Join(ws, "."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 != id2 {
+		t.Fatalf("workspace id changed: first=%q second=%q", id1, id2)
+	}
+	var storage dshWorkspaceStorage
+	raw, err := os.ReadFile(dshWorkspaceRegistryPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &storage); err != nil {
+		t.Fatal(err)
+	}
+	workspace, ok := storage.Tables.Workspaces[id1]
+	if !ok {
+		t.Fatalf("workspace %q missing from registry", id1)
+	}
+	if workspace.Path != ws || len(workspace.SessionIDs) != 0 {
+		t.Fatalf("unexpected workspace record: %+v", workspace)
+	}
+}
+
 func TestRegisterDeepSeekHarnessWorkspaceCreatesAndReusesByCanonicalPath(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

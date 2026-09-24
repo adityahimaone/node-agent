@@ -566,6 +566,13 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		if err := validateDSHBinary(bin); err != nil {
 			return "", false, "dsh_unavailable: " + err.Error()
 		}
+		// Ensure the durable workspace record + id exist BEFORE dsh spawns, so
+		// a first run lands in the Switchyard workspace (grouped) instead of
+		// Ungrouped. The record is reused by canonical path; a GUI-created
+		// workspace of the same path returns its existing id unchanged.
+		if _, ensureErr := ensureDSHWorkspace(ws); ensureErr != nil {
+			return "", false, "dsh_workspace_ensure_failed: " + ensureErr.Error()
+		}
 		resolvedBin = bin
 		resolvedArgs = deepSeekHarnessArgs(job.DSHSessionID)
 		// Sessions created before the worker had its own DSH_HOME live under
@@ -1814,6 +1821,78 @@ func newUUID() (string, error) {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]), hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16])), nil
+}
+
+// ensureDSHWorkspace resolves (creating when needed) the durable workspace id
+// for an existing directory. DSH's own registry is the source of truth for
+// grouping, so record-pre-create reuses exactly what a GUI-created workspace
+// would: the same canonical path yields the same id, and a pre-created record
+// with no sessions is returned unchanged. Must stay in sync with the schema
+// DSH writes for its workspace records.
+func ensureDSHWorkspace(workspacePath string) (string, error) {
+	path := dshWorkspaceRegistryPath()
+	if path == "" {
+		return "", fmt.Errorf("resolve dsh home: no usable DSH_HOME")
+	}
+	canonicalPath, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize workspace: %w", err)
+	}
+	dshWorkspaceMu.Lock()
+	defer dshWorkspaceMu.Unlock()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// DSH has not written its workspace registry yet. Start an empty one
+		// instead of failing the dispatch.
+		if os.IsNotExist(err) {
+			raw = []byte(`{"unit":{},"global":{},"tables":{"workspaces":{}}}`)
+		} else {
+			return "", fmt.Errorf("read workspace registry: %w", err)
+		}
+	}
+	var storage dshWorkspaceStorage
+	if err := json.Unmarshal(raw, &storage); err != nil {
+		return "", fmt.Errorf("decode workspace registry: %w", err)
+	}
+	if storage.Tables.Workspaces == nil {
+		storage.Tables.Workspaces = map[string]dshWorkspace{}
+	}
+	for id, workspace := range storage.Tables.Workspaces {
+		storedPath, pathErr := filepath.EvalSymlinks(workspace.Path)
+		if pathErr == nil && storedPath == canonicalPath {
+			return id, nil
+		}
+	}
+	workspaceID, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if storage.Global == nil {
+		storage.Global = map[string]any{}
+	}
+	storage.Tables.Workspaces[workspaceID] = dshWorkspace{
+		Path: canonicalPath, Title: filepath.Base(canonicalPath),
+		SessionIDs: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	ids, _ := storage.Global["workspaceIds"].([]any)
+	storage.Global["workspaceIds"] = append([]any{workspaceID}, ids...)
+	updated, err := json.MarshalIndent(storage, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("encode workspace registry: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", fmt.Errorf("prepare workspace registry dir: %w", err)
+	}
+	if err := os.WriteFile(tmp, append(updated, '\n'), 0644); err != nil {
+		return "", fmt.Errorf("write workspace registry: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("commit workspace registry: %w", err)
+	}
+	return workspaceID, nil
 }
 
 func deepSeekHarnessArgs(sessionID string) []string {
