@@ -640,6 +640,14 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	if executor == "dsh" && sessionID != "" && os.Getenv("NODE_AGENT_DSH_PUBLISH") != "0" {
 		publishSessionToLegacyHome(sessionID, ws)
 	}
+	// Live-sync the session into the running daemon so the UI groups it under
+	// the workspace immediately — no restart (watcher) needed. Best-effort:
+	// a failure here must never abort an otherwise-finished dispatch.
+	if executor == "dsh" && sessionID != "" {
+		if syncErr := syncDSHWebSession(ctx, sessionID, ws); syncErr != nil {
+			log.Printf("dsh web sync (soft): %v", syncErr)
+		}
+	}
 
 	// Provenance header: first line of every result proves which binary ran.
 	provenance := fmt.Sprintf("provenance executor=%s requested=%s bin=%s args=%q ws=%s",
