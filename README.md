@@ -43,6 +43,7 @@ The server keeps the queue and results in memory. An agent registers, sends hear
 | `hermes` | `hermes` | `hermes chat -q` | Uses `HERMES_WORKSPACE` |
 | `codex` | `codex` | `codex exec --full-auto` | Non-interactive coding tasks |
 | `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
+| `dsh` | `dsh` | `--profile headless --json` | DeepSeek Harness session; isolated `DSH_HOME` |
 | `shell` | OS shell | `bash -lc` or `cmd /c` | `command` only; `body` is description — empty `command` rejected |
 | `auto` | Available capability | Hermes, then Codex, then CommandCode | Compatibility mode |
 
@@ -60,6 +61,33 @@ cmd -p "<prompt>" --yolo --skip-onboarding --output-format text
 
 References: [headless mode](https://commandcode.ai/docs/headless) and [CLI reference](https://commandcode.ai/docs/reference/cli).
 
+### DeepSeek Harness
+
+`dsh` runs the DeepSeek Harness headless profile on the workspace host:
+
+```sh
+dsh --profile headless --json
+```
+
+A continuation adds `--session-id <id>` and resumes the same session; the first
+run omits it. The worker reads the session ID and cwd from the emitted `session`
+event and fails the run with `dsh_session_missing` when `--json` produces no
+session event, rather than reporting silent success.
+
+`dsh` is a Node launcher and launchd starts the worker with a minimal `PATH`, so
+the worker prepends `/opt/homebrew/bin` for every DSH invocation, including the
+`--version` health check.
+
+Agent runs use an isolated home (`~/.dsh-nodeagent`, overridable with
+`NODE_AGENT_DSH_HOME`), keeping their session locks separate from the `dsh web`
+daemon's. Finished sessions are mirrored back into `~/.dsh` and registered in
+its workspace registry so `dsh web` can list them. Because DSH write handles are
+`flock(2)` leases that the installed build never expires, retrying a conflict
+does not help — isolating the home does.
+
+Full contract, session identity rules, and troubleshooting:
+[docs/dsh-harness.md](docs/dsh-harness.md).
+
 ## Register and capabilities
 
 At startup the agent finds available binaries and sends capabilities:
@@ -70,7 +98,7 @@ At startup the agent finds available binaries and sends capabilities:
   "hostname": "worker-mac",
   "version": "0.3.0",
   "workspaces": ["/Users/<user>/Development"],
-  "executors": ["hermes", "codex", "commandcode", "shell"],
+  "executors": ["hermes", "codex", "commandcode", "dsh", "shell"],
   "versions": {"commandcode": "..."}
 }
 ```
@@ -110,6 +138,25 @@ Switchyard creates tasks with `executor: "shell"` and a dedicated `command`. The
   "command": "git status && pnpm test"
 }
 ```
+
+DSH dispatches carry session continuity fields. Switchyard sends
+`dsh_workspace_id`, `dsh_session_id`, `last_turn_seq`, `last_comment_id`,
+`run_id`, and `session_continuation`; the worker returns `dsh_workspace_id`,
+`dsh_session_id`, and the highest consumed `last_turn_seq`:
+
+```json
+{
+  "task_id": "t3",
+  "board": "saas",
+  "message": "Continue from the last review comment",
+  "workspace": "/Users/<user>/Development/saas",
+  "executor": "dsh",
+  "dsh_session_id": "session-<uuid>",
+  "session_continuation": true
+}
+```
+
+See [docs/dsh-harness.md](docs/dsh-harness.md) for what the worker guarantees.
 
 POST /api/dispatch body accepts `conversation_id`, `append_only`, and
 `context_window`. When `conversation_id` is empty the agent resolves one per
@@ -201,6 +248,20 @@ NODE_AGENT_NO_RTK=1
 
 `NODE_AGENT_NO_RTK=1` disables `rtk` rewriting for shell executors. Without it, the agent tries `rtk hook check` and then `rtk rewrite`, each with an 800 ms limit, and uses the original command when rewriting fails. The executable name remains `rtk`.
 
+DeepSeek Harness variables:
+
+```sh
+NODE_AGENT_DSH_HOME=$HOME/.dsh-nodeagent   # isolated session home (default)
+NODE_AGENT_DSH_PUBLISH=0                   # skip mirroring sessions into ~/.dsh
+NODE_AGENT_DSH_WORKSPACE_REGISTRATION=0    # skip workspace registry writes
+NODE_AGENT_DSH_WEB_URL=http://127.0.0.1:3080/
+NODE_AGENT_DSH_CONFLICT_RETRIES=30
+NODE_AGENT_DSH_CONFLICT_DELAY_MS=1000
+```
+
+Leave `NODE_AGENT_DSH_HOME` unset to keep the default isolated home. Do not
+point it at `~/.dsh` — that restores the lock contention with `dsh web`.
+
 The token must match on the server and every agent. Store it in `~/.hermes/node-agent.env` with file mode `0600`.
 
 ## Install the server on the VPS
@@ -289,10 +350,33 @@ Verify the path in `workspaces.json` is a prefix of the task path. Slash differe
 
 Linux and macOS require `cmd` or `command-code`. Windows requires `cmdc` or `command-code`. Run `cmd --version`, `cmdc --version`, or `command-code --version` locally as the service user.
 
+### `dsh_session_conflict`
+
+Something else owns the session's DSH write handle — normally `dsh web` running
+on the same home. Confirm the agent uses the isolated home
+(`lsof -p <worker-pid> | grep session.lock`) instead of tuning retries.
+`NODE_AGENT_DSH_CONFLICT_RETRIES` only buys time; it does not release a foreign
+lock.
+
+### `dsh_unavailable: DeepSeek Harness (dsh) not installed or not on PATH`
+
+Install `@deepseek-ai/dsh` on the worker host and restart node-agent so
+capabilities refresh. Verify with `dsh --version` under the minimal environment
+launchd provides — `dsh` is a Node launcher and needs Homebrew on `PATH`.
+
+### DSH sessions are missing from `dsh web`
+
+Sessions live in the isolated home until the worker publishes them. Check that
+`NODE_AGENT_DSH_PUBLISH` is not `0` and that the worker log shows
+`dsh session publish: mirrored session ...`. A mirrored transcript without a
+registry entry still does not appear — see
+[docs/dsh-harness.md](docs/dsh-harness.md).
+
 ## Related repositories and references
 
 - [Switchyard](https://github.com/adityahimaone/switchyard) — control plane, dispatcher, and review gate
 - [CommandCode CLI reference](https://commandcode.ai/docs/reference/cli)
 - [CommandCode headless mode](https://commandcode.ai/docs/headless)
+- [DeepSeek Harness executor contract](docs/dsh-harness.md) — session identity, isolated home, publishing
 - [RTK](https://github.com/rtk-ai/rtk) — command output reduction
 - [Caveman](https://github.com/JuliusBrussee/caveman) — result compression target
