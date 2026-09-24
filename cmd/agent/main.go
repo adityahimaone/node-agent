@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"node-agent/internal/conversation"
+	"node-agent/internal/heartbeat"
 	"node-agent/internal/transport"
 )
 
@@ -188,13 +189,19 @@ func main() {
 }
 
 func heartbeatLoop(server, nodeID string) {
+	dshCache := heartbeat.NewDSHProbeCache(60 * time.Second)
 	for {
 		time.Sleep(15 * time.Second)
 		status := "idle"
 		if atomic.LoadInt32(&busy) == 1 {
 			status = "busy"
 		}
-		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: status})
+		var dsh *heartbeat.DSHHealth
+		if dshBin, _ := exec.LookPath("dsh"); dshBin != "" {
+			h := dshCache.Get(dshBin)
+			dsh = &h
+		}
+		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: status, DSHHealth: dsh})
 	}
 }
 
