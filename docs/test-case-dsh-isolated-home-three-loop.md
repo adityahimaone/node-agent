@@ -92,6 +92,36 @@ loop 3  remote_dispatched 1790218627 -> completed 1790218735  error=""
   `dsh web` PID 198 still held 18 legacy locks throughout
 - `workspace_transport=node-agent` (not downgraded to `ssh`)
 
+## Four-loop result (card `t_54e3ba28`)
+
+Second run against a fresh card, four loops, same isolated-home binary.
+
+Board `f8-bisadaya`, workspace
+`/Users/adityahimawan/Development/bisadaya-monorepo`, `executor=dsh`,
+`workspace_transport=node-agent` (auto-routed), `created_by=user`.
+
+```
+run 1  --profile headless --json
+       remote_dispatched 1790219772 -> completed 1790219788  error=""
+run 2  ... --session-id session-a456789d-3f60-4534-a479-1d735ba85700
+       remote_dispatched 1790219819 -> completed 1790219835  error=""
+run 3  ... --session-id session-a456789d-...
+       remote_dispatched 1790219865 -> completed 1790219897  error=""
+run 4  ... --session-id session-a456789d-...
+       remote_dispatched 1790219928 -> completed 1790219939  error=""
+```
+
+- one session for all four runs: `session-a456789d-3f60-4534-a479-1d735ba85700`
+- run 1 omits `--session-id` (initial); runs 2-4 pass it (continuations)
+- `write handle` / `dsh_session_conflict` events: **0**
+- `consecutive_failures=0`, `last_failure_error=''`, status `review`
+- Mac: isolated transcript grew to 64,376 bytes; session absent from legacy
+  `~/.dsh` (agent-only, as intended)
+
+Creating the card: the CLI has no `--executor` flag and the board API needs a
+session cookie, so create through the board's own production `CreateTask` and
+let it derive transport from the workspace path. Do not hand-write the row.
+
 ## Notes
 
 - One transient `409: executor unavailable on node: dsh` fires between the Mac

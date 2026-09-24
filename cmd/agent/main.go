@@ -628,6 +628,11 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 			return string(out), false, "dsh_workspace_registration_failed: " + registrationErr.Error()
 		}
 	}
+	// The agent's private home keeps its lock off the daemon's, which means the
+	// `dsh web` UI (~/.dsh only) cannot list agent sessions without a mirror.
+	if executor == "dsh" && sessionID != "" && os.Getenv("NODE_AGENT_DSH_PUBLISH") != "0" {
+		publishSessionToLegacyHome(sessionID, ws)
+	}
 
 	// Provenance header: first line of every result proves which binary ran.
 	provenance := fmt.Sprintf("provenance executor=%s requested=%s bin=%s args=%q ws=%s",
@@ -1503,6 +1508,55 @@ func dshWorkspaceRegistryPath() string {
 		return ""
 	}
 	return filepath.Join(home, "storages", "workspace.json")
+}
+
+// publishSessionToLegacyHome mirrors a finished agent session back into the
+// user's ~/.dsh so the `dsh web` UI can list and open it. Agents run under an
+// isolated DSH_HOME, which keeps their lock off the daemon's session lock; the
+// UI reads only ~/.dsh, so without this mirror agent work is invisible there.
+// Only the transcript is copied — never session.lock, or the two homes would
+// share the inode that caused the original conflict.
+func publishSessionToLegacyHome(sessionID, workspacePath string) bool {
+	iso := dshIsolatedHome()
+	sessionID = strings.TrimSpace(sessionID)
+	if iso == "" || sessionID == "" {
+		return false
+	}
+	canonical, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	dirName := dshSessionDirName(canonical)
+	src := filepath.Join(iso, "sessions", dirName, sessionID)
+	dst := filepath.Join(home, ".dsh", "sessions", dirName, sessionID)
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return false
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		// Already mirrored. Refresh only when the agent copy is strictly newer,
+		// so a session the web UI advanced is never rolled back.
+		dstInfo, err := os.Stat(dst)
+		if err != nil || !srcInfo.ModTime().After(dstInfo.ModTime()) {
+			return false
+		}
+	}
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		log.Printf("dsh session publish %s: mkdir: %v", sessionID, err)
+		return false
+	}
+	if err := copyDirTree(src, dst); err != nil {
+		log.Printf("dsh session publish %s: %v (web UI may not list this session)", sessionID, err)
+		return false
+	}
+	// The copied lock file is meaningless (and misleading) in the target home.
+	_ = os.Remove(filepath.Join(dst, "session.lock"))
+	log.Printf("dsh session publish: mirrored session %s to %s", sessionID, dst)
+	return true
 }
 
 // dshSessionDirName mirrors DSH's on-disk session directory naming: the

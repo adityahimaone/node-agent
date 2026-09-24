@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"node-agent/internal/transport"
 )
@@ -241,6 +242,88 @@ func TestAdoptLegacySessionCopiesIntoIsolatedHome(t *testing.T) {
 	}
 	if os.SameFile(srcInfo, dstInfo) {
 		t.Fatal("adopted session shares the user's lock file; exclusion would not hold")
+	}
+}
+
+func TestPublishSessionToLegacyHomeKeepsWebVisibleCopy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+
+	ws := mustTempDir(t)
+	canonical, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relDir := dshSessionDirName(canonical)
+	const sid = "session-agent"
+	isoDir := filepath.Join(dshIsolatedHome(), "sessions", relDir, sid)
+	if err := os.MkdirAll(isoDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(isoDir, "session.v3.jsonl.zstd"), []byte("agent-events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !publishSessionToLegacyHome(sid, ws) {
+		t.Fatal("agent session was not published to the legacy home")
+	}
+	published := filepath.Join(home, ".dsh", "sessions", relDir, sid, "session.v3.jsonl.zstd")
+	if raw, err := os.ReadFile(published); err != nil || string(raw) != "agent-events" {
+		t.Fatalf("published transcript unreadable: %v", err)
+	}
+	// Never publish the lock: sharing the inode reintroduces the daemon conflict.
+	if _, err := os.Stat(filepath.Join(home, ".dsh", "sessions", relDir, sid, "session.lock")); !os.IsNotExist(err) {
+		t.Fatal("published session carried the lock file; isolation would break")
+	}
+}
+
+func TestPublishSessionToLegacyHomeNeverOverwritesNewerTranscript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+
+	ws := mustTempDir(t)
+	canonical, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relDir := dshSessionDirName(canonical)
+	const sid = "session-race"
+	isoDir := filepath.Join(dshIsolatedHome(), "sessions", relDir, sid)
+	legacyDir := filepath.Join(home, ".dsh", "sessions", relDir, sid)
+	for _, d := range []string{isoDir, legacyDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	isoFile := filepath.Join(isoDir, "session.v3.jsonl.zstd")
+	legacyFile := filepath.Join(legacyDir, "session.v3.jsonl.zstd")
+	if err := os.WriteFile(isoFile, []byte("older"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyFile, []byte("newer-web-events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(isoFile, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	publishSessionToLegacyHome(sid, ws)
+	if raw, _ := os.ReadFile(legacyFile); string(raw) != "newer-web-events" {
+		t.Fatalf("stale agent transcript clobbered a newer legacy one: %q", raw)
+	}
+}
+
+func TestPublishSessionToLegacyHomeNoOpWithoutIsolatedHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+
+	ws := mustTempDir(t)
+	if publishSessionToLegacyHome("session-x", ws) {
+		t.Fatal("nothing to publish when the isolated home has no such session")
 	}
 }
 
