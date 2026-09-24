@@ -195,8 +195,64 @@ func TestDSHWorkspaceRegistryFollowsIsolatedHome(t *testing.T) {
 	}
 }
 
-// First registration in a fresh isolated home must bootstrap the registry
-// rather than fail because DSH has not written workspace.json yet.
+// Sessions created before the isolated home existed live under ~/.dsh. A
+// continuation of one of those cards must still resolve, so the worker adopts
+// (copies) the legacy session directory into its own home on first use. The
+// copy is what gives the worker a private lock inode — the original stays
+// locked by the user's `dsh web` daemon.
+func TestAdoptLegacySessionCopiesIntoIsolatedHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+
+	ws := mustTempDir(t)
+	canonical, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relDir := dshSessionDirName(canonical)
+	const sid = "session-legacy"
+	legacy := filepath.Join(home, ".dsh", "sessions", relDir, sid)
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "session.v3.jsonl.zstd"), []byte("events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "session.lock"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !adoptLegacyDSHSession(sid, ws) {
+		t.Fatal("legacy session was not adopted")
+	}
+	adopted := filepath.Join(dshIsolatedHome(), "sessions", relDir, sid, "session.v3.jsonl.zstd")
+	if raw, err := os.ReadFile(adopted); err != nil || string(raw) != "events" {
+		t.Fatalf("adopted session unreadable: %v", err)
+	}
+	// The lock must be a fresh file in the isolated home, not a shared inode.
+	srcInfo, err := os.Stat(filepath.Join(legacy, "session.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstInfo, err := os.Stat(filepath.Join(dshIsolatedHome(), "sessions", relDir, sid, "session.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(srcInfo, dstInfo) {
+		t.Fatal("adopted session shares the user's lock file; exclusion would not hold")
+	}
+}
+
+func TestAdoptLegacySessionIsNoOpWhenAlreadyAdopted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+	ws := mustTempDir(t)
+	if adoptLegacyDSHSession("session-absent", ws) {
+		t.Fatal("nothing to adopt for an unknown session")
+	}
+}
 func TestRegisterDeepSeekHarnessWorkspaceBootstrapsFreshHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

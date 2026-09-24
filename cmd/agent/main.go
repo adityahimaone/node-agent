@@ -568,6 +568,11 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		}
 		resolvedBin = bin
 		resolvedArgs = deepSeekHarnessArgs(job.DSHSessionID)
+		// Sessions created before the worker had its own DSH_HOME live under
+		// the user's ~/.dsh; adopt them so existing card continuations resolve.
+		if strings.TrimSpace(job.DSHSessionID) != "" {
+			adoptLegacyDSHSession(job.DSHSessionID, ws)
+		}
 		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
 		// launchd PATH omits Homebrew; dsh's shebang resolves node through env.
 		cmd.Env = dshCommandEnv()
@@ -1498,6 +1503,100 @@ func dshWorkspaceRegistryPath() string {
 		return ""
 	}
 	return filepath.Join(home, "storages", "workspace.json")
+}
+
+// dshSessionDirName mirrors DSH's on-disk session directory naming: the
+// canonical cwd with separators flattened, fenced by "--". e.g.
+// /Users/x/Development/blog -> --Users-x-Development-blog--
+func dshSessionDirName(cwd string) string {
+	return "-" + strings.ReplaceAll(cwd, string(filepath.Separator), "-") + "--"
+}
+
+// adoptLegacyDSHSession copies a session created before the isolated home
+// existed (living under the user's ~/.dsh) into the worker's private home, so
+// continuations of already-bound cards keep working. Returns true when a copy
+// was made. The copy is the point: it gets its own lock inode, so the user's
+// live `dsh web` daemon keeps its lease on the original without blocking the
+// worker. Existing sessions are never overwritten.
+func adoptLegacyDSHSession(sessionID, workspacePath string) bool {
+	iso := dshIsolatedHome()
+	sessionID = strings.TrimSpace(sessionID)
+	if iso == "" || sessionID == "" {
+		return false
+	}
+	canonical, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return false
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	dirName := dshSessionDirName(canonical)
+	src := filepath.Join(home, ".dsh", "sessions", dirName, sessionID)
+	dst := filepath.Join(iso, "sessions", dirName, sessionID)
+	if _, err := os.Stat(src); err != nil {
+		return false
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		return false // already adopted
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		log.Printf("dsh session adopt %s: mkdir: %v", sessionID, err)
+		return false
+	}
+	if err := copyDirTree(src, dst); err != nil {
+		_ = os.RemoveAll(dst)
+		log.Printf("dsh session adopt %s: %v (falling back to legacy session store)", sessionID, err)
+		return false
+	}
+	log.Printf("dsh session adopt: copied legacy session %s for workspace %s", sessionID, canonical)
+	return true
+}
+
+// copyDirTree recursively copies files and directories, preserving modes and
+// never following symlinks (a symlinked lock file would defeat the isolation).
+func copyDirTree(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		from := filepath.Join(src, entry.Name())
+		to := filepath.Join(dst, entry.Name())
+		entryInfo, err := os.Lstat(from)
+		if err != nil {
+			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if entryInfo.IsDir() {
+			if err := copyDirTree(from, to); err != nil {
+				return err
+			}
+			continue
+		}
+		// Regular file (the read-only lock is copied to a fresh inode).
+		if entryInfo.Mode()&os.ModeType != 0 {
+			continue
+		}
+		raw, err := os.ReadFile(from)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(to, raw, entryInfo.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func dshWorkspaceID(workspacePath string) string {
