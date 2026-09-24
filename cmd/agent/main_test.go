@@ -45,9 +45,10 @@ func TestParseDeepSeekHarnessSessionEvent(t *testing.T) {
 func TestRegisterDeepSeekHarnessWorkspaceCreatesAndReusesByCanonicalPath(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
 	ws := mustTempDir(t)
-	registry := filepath.Join(home, ".dsh", "storages")
-	if err := os.MkdirAll(registry, 0o755); err != nil {
+	registry := filepath.Join(home, ".dsh-nodeagent", "storages")
+	if err := os.MkdirAll(registry, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	initial := `{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":[],"archivedSessionIds":[]},"tables":{"workspaces":{}}}`
@@ -78,10 +79,24 @@ func TestRegisterDeepSeekHarnessWorkspaceCreatesAndReusesByCanonicalPath(t *test
 	}
 }
 
-func TestRegisterDeepSeekHarnessWorkspaceRejectsMissingRegistry(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+// A missing registry in a fresh isolated home is bootstrapped (see
+// TestRegisterDeepSeekHarnessWorkspaceBootstrapsFreshHome). Genuine I/O errors
+// must still fail closed rather than silently dropping the registration.
+func TestRegisterDeepSeekHarnessWorkspaceFailsClosedOnUnwritableRegistry(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+	registry := filepath.Join(home, ".dsh-nodeagent", "storages")
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A directory where the registry file belongs: readable as ENOENT-free but
+	// never writable.
+	if err := os.MkdirAll(filepath.Join(registry, "workspace.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := registerDeepSeekHarnessWorkspace(mustTempDir(t), "session-1"); err == nil {
-		t.Fatal("expected missing registry error")
+		t.Fatal("expected unreadable registry to fail closed")
 	}
 }
 
@@ -110,6 +125,103 @@ func TestDSHCommandEnvIncludesHomebrewNodePaths(t *testing.T) {
 	env := strings.Join(dshCommandEnv(), "\n")
 	if !strings.Contains(env, "PATH=/opt/homebrew/bin:/usr/local/bin:/test/bin") {
 		t.Fatalf("dsh environment does not include launchd-safe Node paths: %s", env)
+	}
+}
+
+// A user-owned `dsh web` daemon holds a kernel flock lease on every session it
+// has open, for the whole life of its write handle and with no expiry by
+// design. An agent-dispatched headless continuation of the same session then
+// always fails with "already owned by an active write handle". Give the worker
+// its own DSH_HOME so sessions, storages and locks stay private, while the
+// shared config files stay symlinked to the user's real ~/.dsh.
+func TestDSHCommandEnvIsolatesSessionHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+	if err := os.MkdirAll(filepath.Join(home, ".dsh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".dsh", "settings.yaml"), []byte("shared: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	iso := filepath.Join(home, ".dsh-nodeagent")
+	env := strings.Join(dshCommandEnv(), "\n")
+	if !strings.Contains(env, "DSH_HOME="+iso) {
+		t.Fatalf("dsh environment does not isolate DSH_HOME, env=%s", env)
+	}
+	if _, err := os.Stat(iso); err != nil {
+		t.Fatalf("isolated DSH_HOME was not created: %v", err)
+	}
+	// Shared config must resolve through the symlink, not be copied.
+	link := filepath.Join(iso, "settings.yaml")
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("shared settings not linked into isolated home: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("expected %s to be a symlink to the user config, got mode %s", link, fi.Mode())
+	}
+	// Sessions must NOT be shared — private dir, not a symlink to ~/.dsh/sessions.
+	sessions := filepath.Join(iso, "sessions")
+	if fi, err := os.Lstat(sessions); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("isolated home must not share the user's session store: %s", sessions)
+	}
+}
+
+func TestDSHIsolatedHomeAllowsExplicitOverride(t *testing.T) {
+	t.Setenv("NODE_AGENT_DSH_HOME", "/tmp/custom-dsh-home")
+	if got := dshIsolatedHome(); got != "/tmp/custom-dsh-home" {
+		t.Fatalf("explicit NODE_AGENT_DSH_HOME ignored, got %q", got)
+	}
+}
+
+// The workspace registry must live in the same DSH_HOME the headless process
+// runs against, otherwise registration writes to a home no DSH run reads.
+func TestDSHWorkspaceRegistryFollowsIsolatedHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+
+	if err := os.MkdirAll(filepath.Join(home, ".dsh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".dsh-nodeagent", "storages", "workspace.json")
+	if got := dshWorkspaceRegistryPath(); got != want {
+		t.Fatalf("registry path=%q, want %q", got, want)
+	}
+	if got := dshHome(); got != filepath.Join(home, ".dsh-nodeagent") {
+		t.Fatalf("dshHome=%q, want isolated home", got)
+	}
+}
+
+// First registration in a fresh isolated home must bootstrap the registry
+// rather than fail because DSH has not written workspace.json yet.
+func TestRegisterDeepSeekHarnessWorkspaceBootstrapsFreshHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+	if err := os.MkdirAll(filepath.Join(home, ".dsh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ws := mustTempDir(t)
+
+	if err := registerDeepSeekHarnessWorkspace(ws, "session-bootstrap"); err != nil {
+		t.Fatalf("fresh-home registration failed: %v", err)
+	}
+	if id := dshWorkspaceID(ws); id == "" {
+		t.Fatal("registered workspace id not resolvable from isolated home")
+	}
+	canonical, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(dshWorkspaceRegistryPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), canonical) || !strings.Contains(string(raw), "session-bootstrap") {
+		t.Fatalf("registry missing workspace/session: %s", raw)
 	}
 }
 

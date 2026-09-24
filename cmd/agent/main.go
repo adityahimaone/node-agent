@@ -1345,7 +1345,48 @@ func dshWebAvailable() bool {
 }
 
 func dshCommandEnv() []string {
-	return append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:"+os.Getenv("PATH"))
+	env := append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:"+os.Getenv("PATH"))
+	if home := dshIsolatedHome(); home != "" {
+		env = append(env, "DSH_HOME="+home)
+	}
+	return env
+}
+
+// dshIsolatedHome returns the private DSH_HOME agent-dispatched headless runs
+// must use, creating it on first use. A user-owned `dsh web` daemon holds a
+// kernel flock lease on every session it has open, for the whole life of its
+// write handle, with no expiry by design (see dsh-session-persistence-jsonl
+// lease.js). Sharing ~/.dsh therefore makes every agent continuation of a
+// session the user has opened fail with "already owned by an active write
+// handle" — retrying cannot win, because the holder is a long-lived daemon.
+// The isolated home keeps sessions, storages and locks private; the user's
+// config files are symlinked in so credentials and profiles stay in sync.
+func dshIsolatedHome() string {
+	if override := strings.TrimSpace(os.Getenv("NODE_AGENT_DSH_HOME")); override != "" {
+		return override
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	iso := filepath.Join(home, ".dsh-nodeagent")
+	if err := os.MkdirAll(iso, 0o700); err != nil {
+		log.Printf("dsh isolated home: mkdir %s: %v (falling back to shared ~/.dsh)", iso, err)
+		return ""
+	}
+	shared := filepath.Join(home, ".dsh")
+	for _, name := range []string{"profiles", "settings.yaml", ".credentials.yaml", ".anonymous-user-id"} {
+		src := filepath.Join(shared, name)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		dst := filepath.Join(iso, name)
+		if _, err := os.Lstat(dst); err == nil {
+			continue
+		}
+		_ = os.Symlink(src, dst)
+	}
+	return iso
 }
 
 func findBin(name string) string {
@@ -1435,16 +1476,40 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 	return out, waitErr
 }
 
+// dshHome is the DSH_HOME the worker runs against: the isolated home when
+// available, else the user's real ~/.dsh. Anything reading or writing DSH
+// on-disk state must resolve through this so it stays in the same home the
+// headless process was launched with.
+func dshHome() string {
+	if iso := dshIsolatedHome(); iso != "" {
+		return iso
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".dsh")
+}
+
+// dshWorkspaceRegistryPath is the DSH workspace registry file inside dshHome.
+func dshWorkspaceRegistryPath() string {
+	home := dshHome()
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, "storages", "workspace.json")
+}
+
 func dshWorkspaceID(workspacePath string) string {
 	canonicalPath, err := filepath.EvalSymlinks(workspacePath)
 	if err != nil {
 		return ""
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
+	path := dshWorkspaceRegistryPath()
+	if path == "" {
 		return ""
 	}
-	raw, err := os.ReadFile(filepath.Join(home, ".dsh", "storages", "workspace.json"))
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -1469,16 +1534,21 @@ func registerDeepSeekHarnessWorkspace(workspacePath, sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("canonicalize workspace: %w", err)
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("resolve home: %w", err)
+	path := dshWorkspaceRegistryPath()
+	if path == "" {
+		return fmt.Errorf("resolve dsh home: no usable DSH_HOME")
 	}
-	path := filepath.Join(home, ".dsh", "storages", "workspace.json")
 	dshWorkspaceMu.Lock()
 	defer dshWorkspaceMu.Unlock()
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read workspace registry: %w", err)
+		// First run in a fresh isolated home: DSH has not written its workspace
+		// registry yet. Start an empty one instead of failing the dispatch.
+		if os.IsNotExist(err) {
+			raw = []byte(`{"unit":{},"global":{},"tables":{"workspaces":{}}}`)
+		} else {
+			return fmt.Errorf("read workspace registry: %w", err)
+		}
 	}
 	var storage dshWorkspaceStorage
 	if err := json.Unmarshal(raw, &storage); err != nil {
@@ -1518,6 +1588,11 @@ func registerDeepSeekHarnessWorkspace(workspacePath, sessionID string) error {
 		return fmt.Errorf("encode workspace registry: %w", err)
 	}
 	tmp := path + ".tmp"
+	// The registry lives under DSH_HOME/storages, which may not exist yet in a
+	// freshly created isolated home.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("prepare workspace registry dir: %w", err)
+	}
 	if err := os.WriteFile(tmp, append(updated, '\n'), 0644); err != nil {
 		return fmt.Errorf("write workspace registry: %w", err)
 	}
