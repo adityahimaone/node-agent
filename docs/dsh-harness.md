@@ -115,9 +115,17 @@ flattened and fenced by `--`, e.g.
 
 `dshWorkspaceID(workspacePath)` looks the canonical workspace up in the isolated
 home's workspace registry and returns its ID, or `""` when the workspace is not
-registered yet (a brand-new workspace resolves on the run that registers it).
-The ID is returned in the result so the control plane can confirm the run
-touched the intended workspace.
+registered yet. Before a dsh run spawns, the worker calls
+`ensureDSHWorkspace(workspacePath)`, which **creates the durable workspace
+record (canonical path, title, empty session list) when absent and reuses any
+existing record — including one the `dsh web` GUI created — by canonical path**.
+This pre-create is what makes a brand-new execution land in the workspace
+(grouped) on its very first run instead of appearing under Ungrouped until a
+continuation attaches it. Same-canonical-path runs therefore keep one workspace
+id across the isolated and legacy homes, so GUI-created workspaces like
+`bisadaya-monorepo` receive agent sessions without duplicates. The ID is
+returned in the result so the control plane can confirm the run touched the
+intended workspace.
 
 ## Result provenance
 
