@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"google.golang.org/grpc"
+	"node-agent/internal/heartbeat"
 )
 
 const GRPCServiceName = "nodeagent.v1.NodeAgentService"
@@ -16,6 +17,7 @@ type RegisterFrame struct {
 	Workspaces []string          `json:"workspaces"`
 	Executors  []string          `json:"executors,omitempty"`
 	Versions   map[string]string `json:"versions,omitempty"`
+	DSHHealth  *heartbeat.DSHHealth `json:"dsh_health,omitempty"`
 	Transports []string          `json:"transports,omitempty"`
 }
 type HeartbeatFrame struct {

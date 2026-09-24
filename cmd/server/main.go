@@ -181,7 +181,7 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		reg.Upsert(&heartbeat.Node{NodeID: req.NodeID, Hostname: req.Hostname, Workspaces: req.Workspaces, Executors: req.Executors, Versions: req.Versions, Status: "idle"})
+		reg.Upsert(&heartbeat.Node{NodeID: req.NodeID, Hostname: req.Hostname, Workspaces: req.Workspaces, Executors: req.Executors, Versions: req.Versions, Status: "idle", DSHHealth: req.DSHHealth})
 		qmu.Lock()
 		if _, ok := queues[req.NodeID]; !ok {
 			queues[req.NodeID] = make(chan transport.DispatchRequest, 16)
@@ -194,7 +194,7 @@ func main() {
 		id := chi.URLParam(r, "id")
 		var req transport.HeartbeatRequest
 		_ = transport.ReadJSON(r, &req)
-		if !reg.Heartbeat(id, req.Status) {
+		if !reg.HeartbeatWithHealth(id, req.Status, req.DSHHealth) {
 			http.Error(w, "unknown node", 404)
 			return
 		}

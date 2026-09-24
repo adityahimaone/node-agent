@@ -11,6 +11,7 @@ type Node struct {
 	Workspaces []string          `json:"workspaces"`
 	Executors  []string          `json:"executors,omitempty"`
 	Versions   map[string]string `json:"versions,omitempty"`
+	DSHHealth  *DSHHealth        `json:"dsh_health,omitempty"`
 	LastSeen   time.Time         `json:"last_seen"`
 	Status     string            `json:"status"`               // idle|busy|offline
 	Transports []string          `json:"transports,omitempty"` // e.g. ["http","grpc"]
@@ -45,6 +46,25 @@ func (r *Registry) Heartbeat(id, status string) bool {
 	n.LastSeen = time.Now()
 	if status != "" {
 		n.Status = status
+	}
+	return true
+}
+
+// HeartbeatWithHealth updates status and (when non-nil) the DSH liveness
+// snapshot in one lock.
+func (r *Registry) HeartbeatWithHealth(id, status string, h *DSHHealth) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return false
+	}
+	n.LastSeen = time.Now()
+	if status != "" {
+		n.Status = status
+	}
+	if h != nil {
+		n.DSHHealth = h
 	}
 	return true
 }

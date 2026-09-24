@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"node-agent/internal/heartbeat"
 )
 
 // Request types — plain HTTP JSON, no grpc codegen needed.
@@ -16,13 +18,15 @@ type RegisterRequest struct {
 	Workspaces []string          `json:"workspaces"`          // paths from ~/.hermes/workspaces.json
 	Executors  []string          `json:"executors,omitempty"` // installed runners on this node
 	Versions   map[string]string `json:"versions,omitempty"`
+	DSHHealth  *heartbeat.DSHHealth `json:"dsh_health,omitempty"`
 	Transports []string          `json:"transports,omitempty"`
 }
 
 // Heartbeat
 type HeartbeatRequest struct {
-	NodeID string `json:"node_id"`
-	Status string `json:"status"` // idle|busy
+	NodeID     string                 `json:"node_id"`
+	Status     string                 `json:"status"` // idle|busy
+	DSHHealth  *heartbeat.DSHHealth   `json:"dsh_health,omitempty"`
 }
 
 // Dispatch — server -> agent
