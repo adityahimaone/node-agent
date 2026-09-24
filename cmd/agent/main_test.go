@@ -334,6 +334,48 @@ func TestPublishSessionToLegacyHomeNeverOverwritesNewerTranscript(t *testing.T) 
 	}
 }
 
+func TestPublishSessionToLegacyHomeRefreshesWhenAgentCopyIsNewer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+
+	ws := mustTempDir(t)
+	canonical, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relDir := dshSessionDirName(canonical)
+	const sid = "session-refresh"
+	isoDir := filepath.Join(dshIsolatedHome(), "sessions", relDir, sid)
+	legacyDir := filepath.Join(home, ".dsh", "sessions", relDir, sid)
+	for _, d := range []string{isoDir, legacyDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	isoFile := filepath.Join(isoDir, "session.v3.jsonl.zstd")
+	legacyFile := filepath.Join(legacyDir, "session.v3.jsonl.zstd")
+	if err := os.WriteFile(legacyFile, []byte("old-published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(legacyFile, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(isoFile, []byte("newer-agent-events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every continuation appends to the same transcript file in place, so a
+	// directory-mtime comparison would never see the update.
+	if !publishSessionToLegacyHome(sid, ws) {
+		t.Fatal("newer agent transcript was not re-published; later loops would stay invisible")
+	}
+	if raw, _ := os.ReadFile(legacyFile); string(raw) != "newer-agent-events" {
+		t.Fatalf("published transcript not refreshed: %q", raw)
+	}
+}
+
 func TestPublishSessionToLegacyHomeNoOpWithoutIsolatedHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

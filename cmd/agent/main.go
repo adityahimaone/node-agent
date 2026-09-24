@@ -1510,6 +1510,31 @@ func dshWorkspaceRegistryPath() string {
 	return filepath.Join(home, "storages", "workspace.json")
 }
 
+// dirNewestModTime returns the newest modification time among the direct
+// entries of dir. Comparing files — not the directory — is required because
+// rewriting a transcript in place leaves the parent directory's mtime
+// unchanged, which would make a published session look permanently current.
+func dirNewestModTime(dir string) (time.Time, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}, err
+	}
+	newest := time.Time{}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	if newest.IsZero() {
+		return time.Time{}, fmt.Errorf("no readable entries in %s", dir)
+	}
+	return newest, nil
+}
+
 // publishSessionToLegacyHome mirrors a finished agent session back into the
 // user's ~/.dsh so the `dsh web` UI can list and open it. Agents run under an
 // isolated DSH_HOME, which keeps their lock off the daemon's session lock; the
@@ -1533,17 +1558,14 @@ func publishSessionToLegacyHome(sessionID, workspacePath string) bool {
 	dirName := dshSessionDirName(canonical)
 	src := filepath.Join(iso, "sessions", dirName, sessionID)
 	dst := filepath.Join(home, ".dsh", "sessions", dirName, sessionID)
-	srcInfo, err := os.Stat(src)
+	srcInfo, err := dirNewestModTime(src)
 	if err != nil {
 		return false
 	}
-	if _, err := os.Lstat(dst); err == nil {
-		// Already mirrored. Refresh only when the agent copy is strictly newer,
-		// so a session the web UI advanced is never rolled back.
-		dstInfo, err := os.Stat(dst)
-		if err != nil || !srcInfo.ModTime().After(dstInfo.ModTime()) {
-			return false
-		}
+	if dstTime, err := dirNewestModTime(dst); err == nil && !srcInfo.After(dstTime) {
+		// Already mirrored and not newer. Refreshing is skipped so a session the
+		// web UI advanced is never rolled back.
+		return false
 	}
 	if err := os.MkdirAll(dst, 0o700); err != nil {
 		log.Printf("dsh session publish %s: mkdir: %v", sessionID, err)
