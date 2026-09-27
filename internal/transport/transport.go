@@ -12,21 +12,21 @@ import (
 
 // Register — agent dials in.
 type RegisterRequest struct {
-	NodeID     string            `json:"node_id"` // "mac" / "windows"
-	Hostname   string            `json:"hostname"`
-	Version    string            `json:"version"`
-	Workspaces []string          `json:"workspaces"`          // paths from ~/.hermes/workspaces.json
-	Executors  []string          `json:"executors,omitempty"` // installed runners on this node
-	Versions   map[string]string `json:"versions,omitempty"`
+	NodeID     string               `json:"node_id"` // "mac" / "windows"
+	Hostname   string               `json:"hostname"`
+	Version    string               `json:"version"`
+	Workspaces []string             `json:"workspaces"`          // paths from ~/.hermes/workspaces.json
+	Executors  []string             `json:"executors,omitempty"` // installed runners on this node
+	Versions   map[string]string    `json:"versions,omitempty"`
 	DSHHealth  *heartbeat.DSHHealth `json:"dsh_health,omitempty"`
-	Transports []string          `json:"transports,omitempty"`
+	Transports []string             `json:"transports,omitempty"`
 }
 
 // Heartbeat
 type HeartbeatRequest struct {
-	NodeID     string                 `json:"node_id"`
-	Status     string                 `json:"status"` // idle|busy
-	DSHHealth  *heartbeat.DSHHealth   `json:"dsh_health,omitempty"`
+	NodeID    string               `json:"node_id"`
+	Status    string               `json:"status"` // idle|busy
+	DSHHealth *heartbeat.DSHHealth `json:"dsh_health,omitempty"`
 }
 
 // Dispatch — server -> agent
@@ -47,12 +47,16 @@ type DispatchRequest struct {
 	// by the server from workspaces.json Note — prepended to the agent prompt.
 	PrequestNote string `json:"prequest_note,omitempty"`
 	// DSHSessionID resumes same DeepSeek Harness session for task comments.
-	DSHSessionID        string `json:"dsh_session_id,omitempty"`
-	DSHWorkspaceID      string `json:"dsh_workspace_id,omitempty"`
-	LastTurnSeq         *int64 `json:"last_turn_seq,omitempty"`
-	LastCommentID       *int64 `json:"last_comment_id,omitempty"`
-	RunID               string `json:"run_id,omitempty"`
-	SessionContinuation bool   `json:"session_continuation,omitempty"`
+	DSHSessionID   string `json:"dsh_session_id,omitempty"`
+	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
+	// HarnessKind names the continuity harness ("dsh" or "commandcode").
+	HarnessKind string `json:"harness_kind,omitempty"`
+	// CommandCodeSessionID resumes the same Command Code session for task comments.
+	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
+	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
+	LastCommentID        *int64 `json:"last_comment_id,omitempty"`
+	RunID                string `json:"run_id,omitempty"`
+	SessionContinuation  bool   `json:"session_continuation,omitempty"`
 	// Persistent chat. ConversationID empty => server/agent auto-resolves per
 	// workspace. AppendOnly=false means reset context before this message.
 	ConversationID string `json:"conversation_id,omitempty"`
@@ -75,7 +79,9 @@ type ResultRequest struct {
 	DurationMs     int64  `json:"duration_ms"`
 	DSHSessionID   string `json:"dsh_session_id,omitempty"`
 	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
-	LastTurnSeq    *int64 `json:"last_turn_seq,omitempty"`
+	// CommandCodeSessionID is the Command Code session this run belongs to.
+	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
+	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
 }
 
 func WriteJSON(w http.ResponseWriter, code int, v any) {

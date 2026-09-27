@@ -173,12 +173,20 @@ func main() {
 		atomic.StoreInt32(&busy, 1)
 		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: "busy"})
 		start := time.Now()
+		// Phase markers are telemetry, not results: queue them and let a
+		// background goroutine deliver, so the job does not pay a control-plane
+		// round trip per marker. Close before posting the result so the last
+		// markers land before the terminal state.
+		emitter := newEventEmitter(func(chunk string) {
+			_ = postJSON(server+"/api/nodes/progress", transport.ProgressRequest{TaskID: job.TaskID, Chunk: chunk})
+		})
 		output, ok, errStr := runExclusiveJob(job, func(phase, message string) {
 			marker, _ := json.Marshal(map[string]string{"phase": phase, "label": message})
-			_ = postJSON(server+"/api/nodes/progress", transport.ProgressRequest{TaskID: job.TaskID, Chunk: "HERMES_EVENT: " + string(marker) + "\n"})
+			emitter.Emit("HERMES_EVENT: " + string(marker) + "\n")
 		})
 		dur := time.Since(start).Milliseconds()
 		atomic.StoreInt32(&busy, 0)
+		emitter.Close()
 
 		res := dshResult(job, output, ok, errStr, dur)
 		if err := postJSON(server+"/api/nodes/"+nodeID+"/result", res); err != nil {
@@ -309,6 +317,82 @@ func loadWorkspaces() []string {
 	}
 	return out
 }
+
+// eventEmitter forwards job progress markers to the control plane without
+// blocking the job that produced them.
+//
+// Each emit used to be a synchronous postJSON, so a job spent a full
+// control-plane round trip per phase marker (~65ms Mac->VPS over a DERP
+// relay) purely to report progress, serializing telemetry with real work.
+// Emits now queue and drain on a background goroutine.
+//
+// Ordering is preserved: markers are delivered by a single drainer goroutine
+// in enqueue order, so the streamed log the UI replays stays sequential.
+// Close waits for the queue to drain, so the final markers are never lost
+// before the result is posted.
+type eventEmitter struct {
+	mu     sync.Mutex
+	queue  []string
+	closed bool
+	done   chan struct{}
+	wg     sync.WaitGroup
+	post   func(chunk string)
+}
+
+func newEventEmitter(post func(chunk string)) *eventEmitter {
+	e := &eventEmitter{done: make(chan struct{}), post: post}
+	e.wg.Add(1)
+	go e.drain()
+	return e
+}
+
+// Emit queues a chunk. It never blocks on the network.
+func (e *eventEmitter) Emit(chunk string) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.queue = append(e.queue, chunk)
+	e.mu.Unlock()
+}
+
+func (e *eventEmitter) drain() {
+	defer e.wg.Done()
+	for {
+		e.mu.Lock()
+		if len(e.queue) == 0 {
+			closed := e.closed
+			e.mu.Unlock()
+			if closed {
+				close(e.done)
+				return
+			}
+			// Idle: wait for work instead of spinning.
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+		chunk := e.queue[0]
+		e.queue = e.queue[1:]
+		e.mu.Unlock()
+		e.post(chunk)
+	}
+}
+
+// Close stops accepting chunks and blocks until everything queued is delivered.
+func (e *eventEmitter) Close() {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		<-e.done
+		return
+	}
+	e.closed = true
+	e.mu.Unlock()
+	<-e.done
+	e.wg.Wait()
+}
+
 func postJSON(url string, v any) error {
 	b, _ := json.Marshal(v)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
@@ -598,9 +682,22 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		if bin == "" {
 			return "", false, "executor_unavailable: commandcode (cmd/cmdc)"
 		}
+		// A requested continuation must actually be honored. Silently starting a
+		// fresh session would re-apply the same feedback to files the previous
+		// turn already edited, so refuse instead of downgrading to a cold run.
+		if job.SessionContinuation && strings.TrimSpace(job.CommandCodeSessionID) == "" {
+			return "", false, "commandcode_session_missing: continuation requested but no session id was dispatched (worker/control-plane version mismatch?)"
+		}
 		resolvedBin = bin
-		resolvedArgs = []string{"-p", "--yolo", "--skip-onboarding", "--output-format", "text"}
-		cmd = exec.CommandContext(ctx, bin, "-p", prompt, "--yolo", "--skip-onboarding", "--output-format", "text")
+		// JSON first so the result frame can prove session identity. A build that
+		// predates the flag falls back to text; that run cannot prove continuity
+		// and the control plane treats it as a first run.
+		jsonOutput := true
+		if cached, ok := commandCodeJSONCached(bin); ok {
+			jsonOutput = cached
+		}
+		resolvedArgs = commandCodeArgs(job, jsonOutput)
+		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
 	case "auto":
 		// Auto preserves the historical preference but remains explicit in the result.
 		if findBin("hermes") != "" {
@@ -624,6 +721,17 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	emit("process_spawned", "Starting agent process")
 	out, err := streamCommand(cmd, job.TaskID)
 	emit("process_exited", "Agent process finished")
+	// A build without --output-format json fails on the flag, not on the task.
+	// Retry once in text mode; anything else keeps its original failure.
+	if executor == "commandcode" && err != nil && commandCodeRejectsJSONOutput(out) {
+		commandCodeRememberJSONSupport(resolvedBin, false)
+		fallbackArgs := commandCodeArgs(job, false)
+		resolvedArgs = fallbackArgs
+		retry := exec.CommandContext(ctx, resolvedBin, append(fallbackArgs, prompt)...)
+		retry.Dir = ws
+		emit("process_spawned", "Retrying Command Code without --output-format json")
+		out, err = streamCommand(retry, job.TaskID)
+	}
 	if executor == "dsh" && strings.TrimSpace(job.DSHSessionID) != "" && dshSessionWriteHandleConflict(out) {
 		// Never downgrade a continuation to a cold session. The control plane
 		// binds result identity to the dispatched session and must reject a new ID.
@@ -637,6 +745,12 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	// streamCommand persists every chunk before process completion. Keep final
 	// provenance/result formatting unchanged; live UI reads persisted chunks.
 	sessionID, sessionCWD := parseDeepSeekHarnessSessionEvent(out)
+	// Command Code reports identity on the terminal result frame instead of a
+	// session event; a text-mode fallback run simply yields no id.
+	commandCodeSessionID, _, _ := parseCommandCodeResultEvent(out)
+	if executor == "commandcode" && commandCodeSessionID == "" {
+		commandCodeSessionID = strings.TrimSpace(job.CommandCodeSessionID)
+	}
 	if executor == "dsh" && sessionID != "" && os.Getenv("NODE_AGENT_DSH_WORKSPACE_REGISTRATION") != "0" {
 		if registrationErr := registerDeepSeekHarnessWorkspace(ws, sessionID); registrationErr != nil {
 			return string(out), false, "dsh_workspace_registration_failed: " + registrationErr.Error()
@@ -661,6 +775,14 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		executor, strings.ToLower(strings.TrimSpace(job.Executor)), resolvedBin, resolvedArgs, ws)
 	if sessionID != "" {
 		provenance += fmt.Sprintf(" dsh_session_id=%s dsh_session_cwd=%s", sessionID, sessionCWD)
+	}
+	if commandCodeSessionID != "" {
+		provenance += fmt.Sprintf(" commandcode_session_id=%s", commandCodeSessionID)
+	}
+	// A successful JSON run must prove identity so the control plane can bind it.
+	// A text-mode fallback legitimately cannot, and is treated as a first run.
+	if executor == "commandcode" && commandCodeSessionID == "" && err == nil && commandCodeJSONOutputRequested(resolvedArgs) {
+		return string(out), false, "commandcode_session_missing: headless --output-format json returned no result frame"
 	}
 	if executor == "dsh" && sessionID == "" && err == nil {
 		return string(out), false, "dsh_session_missing: headless --json returned no session event"
@@ -692,7 +814,15 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 }
 
 func dshResult(job transport.DispatchRequest, output string, ok bool, errStr string, durationMs int64) transport.ResultRequest {
-	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq}
+	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, CommandCodeSessionID: job.CommandCodeSessionID}
+	if job.Executor == "commandcode" {
+		// Command Code emits no turn counter, so LastTurnSeq stays nil and the
+		// control plane falls back to its run-ownership fence.
+		if sessionID, _, _ := parseCommandCodeResultEvent([]byte(output)); sessionID != "" {
+			result.CommandCodeSessionID = sessionID
+		}
+		return result
+	}
 	if result.DSHWorkspaceID == "" && job.Executor == "dsh" {
 		result.DSHWorkspaceID = dshWorkspaceID(job.Workspace)
 	}
@@ -1475,15 +1605,45 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
 	var pending []byte
-	flush := func() {
+	// flushSync posts the pending chunk and waits. The final flush must be
+	// synchronous: streamCommand's caller uploads the captured output as the
+	// job result, so returning before the last chunk is persisted would race
+	// the result post against it.
+	flushSync := func() {
 		if len(pending) == 0 {
 			return
 		}
 		_ = postJSON(nodeAgentBase()+"/api/nodes/progress", transport.ProgressRequest{TaskID: taskID, Chunk: string(pending)})
 		pending = nil
 	}
+	// flushAsync posts the pending chunk in the background and starts a fresh
+	// batch. Ticker-driven flushes are progress telemetry and must not sit on
+	// the critical path: each post is a full round trip to the control plane
+	// (~65ms over a DERP relay), and blocking on it stalls reading stdout.
+	// Callers that need durability use flushSync.
+	//
+	// In-flight posts are tracked so the trailing flushSync cannot overtake
+	// them — the control plane replays chunks in arrival order, so an
+	// out-of-order tail would scramble the streamed log.
+	var inFlight sync.WaitGroup
+	flushAsync := func() {
+		if len(pending) == 0 {
+			return
+		}
+		chunk := pending
+		pending = nil
+		inFlight.Add(1)
+		go func() {
+			defer inFlight.Done()
+			_ = postJSON(nodeAgentBase()+"/api/nodes/progress", transport.ProgressRequest{TaskID: taskID, Chunk: string(chunk)})
+		}()
+	}
+	// Exit as soon as both streams are closed. The previous condition also
+	// waited on `pending != nil`, which only the 400ms ticker could clear, so
+	// every job stalled a full tick after its process had already exited.
+	// The trailing flushSync delivers the last chunk immediately instead.
 	stdoutOpen, stderrOpen := true, true
-	for stdoutOpen || stderrOpen || pending != nil {
+	for stdoutOpen || stderrOpen {
 		select {
 		case chunk, ok := <-stdoutCh:
 			if !ok {
@@ -1500,10 +1660,13 @@ func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {
 			out = append(out, chunk...)
 			pending = append(pending, chunk...)
 		case <-ticker.C:
-			flush()
+			flushAsync()
 		}
 	}
-	flush()
+	// Drain background posts before the final chunk so the stream stays ordered,
+	// then deliver the tail synchronously.
+	inFlight.Wait()
+	flushSync()
 	waitErr := cmd.Wait()
 	return out, waitErr
 }
@@ -1916,6 +2079,116 @@ func deepSeekHarnessArgs(sessionID string) []string {
 		args = append(args, "--session-id", strings.TrimSpace(sessionID))
 	}
 	return args
+}
+
+// commandCodeArgs builds the headless Command Code invocation. A first run omits
+// --resume so the CLI mints a real session and returns its id; a continuation
+// resumes the exact session the control plane bound to this card.
+func commandCodeArgs(job transport.DispatchRequest, jsonOutput bool) []string {
+	args := []string{"-p", "--yolo", "--skip-onboarding"}
+	if jsonOutput {
+		args = append(args, "--output-format", "json")
+	} else {
+		args = append(args, "--output-format", "text")
+	}
+	if sessionID := strings.TrimSpace(job.CommandCodeSessionID); sessionID != "" {
+		args = append(args, "--resume", sessionID)
+	}
+	return args
+}
+
+// commandCodeResultEvent is the terminal NDJSON frame emitted by
+// `cmd -p --output-format json`. Every field except the type is optional: a run
+// that dies before a session resolves omits sessionId entirely.
+type commandCodeResultEvent struct {
+	Type       string `json:"type"`
+	Subtype    string `json:"subtype"`
+	SessionID  string `json:"sessionId"`
+	FinalText  string `json:"finalText"`
+	StopReason string `json:"stopReason"`
+	HasUsage   bool   `json:"-"`
+	Usage      *struct {
+		InputTokens     int64 `json:"inputTokens"`
+		OutputTokens    int64 `json:"outputTokens"`
+		TotalTokens     int64 `json:"totalTokens"`
+		CacheReadTokens int64 `json:"cacheReadTokens"`
+	} `json:"usage"`
+}
+
+func parseCommandCodeResultEvent(raw []byte) (string, string, bool) {
+	var sessionID, finalText string
+	var hasUsage bool
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var event commandCodeResultEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			// A partially streamed trailing line lands here; the next poll re-parses it.
+			continue
+		}
+		if event.Type != "result" {
+			continue
+		}
+		sessionID = strings.TrimSpace(event.SessionID)
+		finalText = event.FinalText
+		hasUsage = event.Usage != nil
+	}
+	return sessionID, finalText, hasUsage
+}
+
+// commandCodeRejectsJSONOutput detects a CLI build that predates
+// --output-format json. Only a flag complaint counts: a genuine task failure
+// must never be mistaken for an unsupported flag and retried.
+func commandCodeRejectsJSONOutput(out []byte) bool {
+	text := strings.ToLower(string(out))
+	if !strings.Contains(text, "unknown") && !strings.Contains(text, "invalid") && !strings.Contains(text, "unrecognized") {
+		return false
+	}
+	return strings.Contains(text, "output-format") || strings.Contains(text, "--output-format")
+}
+
+// commandCodeJSONOutputRequested reports whether the run used the JSON stream.
+func commandCodeJSONOutputRequested(args []string) bool {
+	for i, arg := range args {
+		if arg == "--output-format" && i+1 < len(args) {
+			return args[i+1] == "json"
+		}
+		if arg == "--output-format=json" {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	commandCodeJSONMu    sync.Mutex
+	commandCodeJSONByBin = map[string]bool{}
+)
+
+// commandCodeJSONCached reports a previously probed binary's capability.
+func commandCodeJSONCached(bin string) (bool, bool) {
+	commandCodeJSONMu.Lock()
+	defer commandCodeJSONMu.Unlock()
+	supported, ok := commandCodeJSONByBin[bin]
+	return supported, ok
+}
+
+func commandCodeRememberJSONSupport(bin string, supported bool) {
+	commandCodeJSONMu.Lock()
+	defer commandCodeJSONMu.Unlock()
+	commandCodeJSONByBin[bin] = supported
+	if !supported {
+		log.Printf("commandcode: %s does not support --output-format json; falling back to text", bin)
+	}
+}
+
+// commandCodeSupportsJSON records the probe result for this binary.
+func commandCodeSupportsJSON(bin string, probe []byte) bool {
+	supported := !commandCodeRejectsJSONOutput(probe)
+	commandCodeRememberJSONSupport(bin, supported)
+	return supported
 }
 
 var dshSessionEventRE = regexp.MustCompile(`\"type\"\s*:\s*\"session\"[^{\n}]*\"sessionId\"\s*:\s*\"([^\"]+)\"(?:[^{}\n]*\"cwd\"\s*:\s*\"([^\"]*)\")?`)

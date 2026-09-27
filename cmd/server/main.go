@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -280,24 +282,31 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		// find node by workspace prefix: choose node that owns workspace
+		executor := strings.ToLower(strings.TrimSpace(req.Executor))
+		if executor == "" {
+			executor = "auto"
+		}
+		// Route to the node that actually owns the workspace. A miss is an
+		// error: falling back to an arbitrary online node used to silently run
+		// macOS workspaces on the Windows node, which failed much later with
+		// "workspace not found" and surfaced to callers as an empty result.
+		nodes := reg.List()
 		nodeID := ""
 		if req.Workspace != "" {
-			for _, n := range reg.List() {
-				for _, ws := range n.Workspaces {
-					if req.Workspace == ws || len(req.Workspace) > len(ws) && req.Workspace[:len(ws)] == ws {
-						nodeID = n.NodeID
-						break
-					}
-				}
-				if nodeID != "" {
-					break
-				}
+			n := selectNodeForWorkspace(nodes, req.Workspace, executor)
+			if n != nil {
+				nodeID = n.NodeID
+			} else if owners := knownWorkspaceOwners(nodes, req.Workspace); len(owners) > 0 {
+				http.Error(w, "executor unavailable on node(s) owning workspace: "+executor, 409)
+				return
+			} else {
+				http.Error(w, fmt.Sprintf("no node owns workspace %q (registered: %s)", req.Workspace, registeredWorkspaceList(nodes)), 409)
+				return
 			}
-		}
-		// fallback: first idle node
-		if nodeID == "" {
-			for _, n := range reg.List() {
+		} else {
+			// No workspace to match on: any online node will do, but keep the
+			// choice deterministic.
+			for _, n := range nodes {
 				if n.Status != "offline" {
 					nodeID = n.NodeID
 					break
@@ -307,36 +316,6 @@ func main() {
 		if nodeID == "" {
 			http.Error(w, "no nodes available", 503)
 			return
-		}
-		executor := strings.ToLower(strings.TrimSpace(req.Executor))
-		if executor == "" {
-			executor = "auto"
-		}
-		if executor != "auto" {
-			n, _ := reg.Get(nodeID)
-			available := nodeSupports(n, executor)
-			if !available {
-				// A workspace can be registered on more than one node. Prefer a
-				// matching node that actually has the requested executor.
-				for _, candidate := range reg.List() {
-					if candidate.Status == "offline" || !nodeSupports(candidate, executor) {
-						continue
-					}
-					for _, ws := range candidate.Workspaces {
-						if req.Workspace == ws || (len(req.Workspace) > len(ws) && strings.HasPrefix(req.Workspace, ws)) {
-							nodeID, available = candidate.NodeID, true
-							break
-						}
-					}
-					if available {
-						break
-					}
-				}
-			}
-			if !available {
-				http.Error(w, "executor unavailable on node: "+executor, 409)
-				return
-			}
 		}
 		// A retry can reuse task_id. Clear prior result/progress before enqueueing,
 		// otherwise control plane can read stale result immediately.
@@ -520,4 +499,96 @@ func nodeSupports(n *heartbeat.Node, executor string) bool {
 		}
 	}
 	return false
+}
+
+// workspaceOwnedBy reports whether ws is exactly nodeWorkspace or nested inside
+// it. The comparison is path-segment aware so a registered "/Users/dev/app"
+// never claims the unrelated sibling "/Users/dev/application".
+func workspaceOwnedBy(nodeWorkspace, ws string) bool {
+	if nodeWorkspace == ws {
+		return true
+	}
+	if len(ws) <= len(nodeWorkspace) {
+		return false
+	}
+	if !strings.HasPrefix(ws, nodeWorkspace) {
+		return false
+	}
+	// Guard the separator so prefix matching stops at a path boundary
+	// instead of mid-segment ("/Users/dev" must not match "/Users/devX/repo").
+	switch nodeWorkspace[len(nodeWorkspace)-1] {
+	case '/', '\\':
+		return true
+	}
+	c := ws[len(nodeWorkspace)]
+	return c == '/' || c == '\\'
+}
+
+// selectNodeForWorkspace returns the node that owns ws and supports executor,
+// preferring the longest matching workspace prefix. It returns "" when no node
+// claims the workspace — callers must NOT fall back to an arbitrary node,
+// because running a macOS workspace on a Windows node fails with a confusing
+// "workspace not found" error at execution time.
+//
+// Ties on prefix length are broken by NodeID so routing is deterministic
+// (reg.List() iterates a map, whose order Go randomizes per call).
+func selectNodeForWorkspace(nodes []*heartbeat.Node, ws, executor string) *heartbeat.Node {
+	var best *heartbeat.Node
+	bestLen := -1
+	for _, n := range nodes {
+		if n == nil || n.Status == "offline" {
+			continue
+		}
+		if executor != "" && executor != "auto" && !nodeSupports(n, executor) {
+			continue
+		}
+		for _, registered := range n.Workspaces {
+			if !workspaceOwnedBy(registered, ws) {
+				continue
+			}
+			if l := len(registered); l > bestLen || (l == bestLen && best != nil && n.NodeID < best.NodeID) {
+				best, bestLen = n, l
+			}
+		}
+	}
+	return best
+}
+
+// knownWorkspaceOwners lists the nodes that registered ws, regardless of
+// executor support. Used to tell a genuine routing miss ("no node knows this
+// workspace") apart from a capability miss ("only that node is missing the
+// executor"), which need different fixes.
+func knownWorkspaceOwners(nodes []*heartbeat.Node, ws string) []string {
+	var owners []string
+	for _, n := range nodes {
+		if n == nil || n.Status == "offline" {
+			continue
+		}
+		for _, registered := range n.Workspaces {
+			if workspaceOwnedBy(registered, ws) {
+				owners = append(owners, n.NodeID)
+				break
+			}
+		}
+	}
+	return owners
+}
+
+// registeredWorkspaceList renders every online node's registered workspaces for
+// the routing-miss error message, sorted so the message is stable.
+func registeredWorkspaceList(nodes []*heartbeat.Node) string {
+	var all []string
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		for _, ws := range n.Workspaces {
+			all = append(all, n.NodeID+":"+ws)
+		}
+	}
+	if len(all) == 0 {
+		return "none"
+	}
+	sort.Strings(all)
+	return strings.Join(all, ", ")
 }
