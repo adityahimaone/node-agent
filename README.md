@@ -44,8 +44,9 @@ The server keeps the queue and results in memory. An agent registers, sends hear
 | `codex` | `codex` | `codex exec --full-auto` | Non-interactive coding tasks |
 | `dsh` | `dsh` | `--profile headless --json` | DeepSeek Harness session; isolated `DSH_HOME` |
 | `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
+| `omp` | `omp` | `-p --auto-approve --mode json` | oh-my-pi; session continuity via `--resume` |
 | `shell` | OS shell | `bash -lc` or `cmd /c` | `command` only; `body` is description — empty `command` rejected |
-| `auto` | Available capability | Hermes, then Codex, then CommandCode | Compatibility mode |
+| `auto` | Available capability | Hermes, then Codex, then CommandCode, then omp | Compatibility mode |
 
 The agent does not infer the shell from prompt contents. The dispatcher sends the executor explicitly. Shell supports `execution_mode=direct` (the `command` field is executed once) and `execution_mode=agentic` (a read-only planner selects one command at a time, the worker executes it through shell + RTK, and repeats within `max_iterations`). Agentic mode receives task intent in `message`; destructive command patterns are blocked and the final result remains review-gated by Switchyard.
 
@@ -60,6 +61,34 @@ cmd -p "<prompt>" --yolo --skip-onboarding --output-format text
 `--yolo` allows file edits and shell commands. Use this executor only on trusted nodes. The node-agent requests text output so task results stay readable.
 
 References: [headless mode](https://commandcode.ai/docs/headless) and [CLI reference](https://commandcode.ai/docs/reference/cli).
+
+### omp (oh-my-pi)
+
+[`omp`](https://omp.sh) is a coding agent with a native Rust core, shipped as a
+single cross-platform binary. The worker drives it headlessly:
+
+```sh
+omp -p --auto-approve --mode json "<prompt>"
+omp -p --auto-approve --mode json --resume <session-id> "<prompt>"
+```
+
+- `--mode json` makes the run emit NDJSON so the worker can prove session
+  identity. Unlike CommandCode there is no text fallback: a successful run with
+  no session id fails with `omp_session_missing:` rather than binding a guessed
+  id.
+- `--auto-approve` is required because a headless worker cannot answer an
+  interactive approval prompt. It allows file edits and shell commands, so use
+  this executor only on trusted nodes.
+- The binary is `omp` on macOS/Linux and `omp.exe` on Windows; no alias needed.
+  The worker probes it but never installs it.
+
+omp returns no turn sequence, so `last_turn_seq` stays nil and Switchyard relies
+on its run-ownership fence. The worker does not pass `--model`: omp resolves the
+model from the host's own config, so a board-level `model` is ignored for this
+executor.
+
+Full contract, install steps, and troubleshooting:
+[docs/omp-harness.md](docs/omp-harness.md).
 
 ### DeepSeek Harness
 
@@ -98,8 +127,8 @@ At startup the agent finds available binaries and sends capabilities:
   "hostname": "worker-mac",
   "version": "0.3.0",
   "workspaces": ["/Users/<user>/Development"],
-  "executors": ["hermes", "codex", "dsh", "commandcode", "shell"],
-  "versions": {"commandcode": "..."}
+  "executors": ["hermes", "codex", "dsh", "commandcode", "omp", "shell"],
+  "versions": {"commandcode": "...", "omp": "omp/18.4.0"}
 }
 ```
 
@@ -162,7 +191,7 @@ POST /api/dispatch body accepts `conversation_id`, `append_only`, and
 `context_window`. When `conversation_id` is empty the agent resolves one per
 workspace+executor. `append_only=false` clears history before the prompt.
 The agent stores messages under `$HOME/.node-agent/conversations/*.json`.
-Hermes receives context via prompt assembly; codex/commandcode remain
+Hermes receives context via prompt assembly; codex/commandcode/omp remain
 stateless for now.
 
 Fetch the result:
@@ -297,12 +326,18 @@ The installer uses a Scheduled Task at logon and a supervisor to restart the bin
 
 ## Workspace routing
 
-The server matches task paths against prefixes advertised by agents:
+The dispatch endpoint matches the task's workspace against prefixes advertised by agents:
 
 - `/Users/...` usually routes to a Mac node;
 - `C:\...` usually routes to a Windows node;
-- when multiple nodes share a workspace, executor capability filters the candidates;
-- when no workspace matches, `auto` may select the first online node.
+- when multiple nodes share a workspace, the longest prefix wins and executor capability filters the candidates — a node only receives a dispatch for an executor it advertised;
+- when a task carries no workspace, dispatch picks an online node (lowest node id); this is unrelated to the `auto` executor, which resolves an *executor* from installed binaries.
+
+Rejections:
+
+- `409 executor unavailable on node(s) owning workspace: <executor>` — the workspace has owners, but none advertises the requested executor;
+- `409 no node owns workspace "<ws>" (registered: ...)` — no node advertises that workspace prefix;
+- `503 no nodes available` — the registry is empty, or every node is offline.
 
 Agent workspaces are read from `~/.hermes/workspaces.json`:
 
@@ -314,7 +349,20 @@ Switchyard uses the same file as its workspace source of truth. Keep workspace I
 
 ## Timeout and status
 
-Default job timeout is 600 seconds. Timed-out jobs are cancelled and returned as failures. Heartbeats use `idle` or `busy` so the server does not send work to a busy agent.
+Default job timeout is 600 seconds (`NODE_AGENT_JOB_TIMEOUT`). Timed-out jobs are cancelled and returned as failures. Heartbeats use `idle` or `busy` so the server does not send work to a busy agent.
+
+Shell jobs in `execution_mode=agentic` get a different default, **1200 seconds** (`NODE_AGENT_SHELL_AGENTIC_TIMEOUT`), because the planner loop runs several commands per iteration. A single dispatch may also carry its own `timeout_s`, which overrides both defaults for that job only — this is how a long verification run gets a longer budget without making every hung job wait for it. The agent clamps that override to a 60s floor and a 6h ceiling.
+
+## Artifacts
+
+A run that produces files (verification screenshots, an accessibility report) can have them collected automatically. When a dispatch carries `artifact_dir`, the agent uploads everything in that directory to the node-agent server before posting its result, and reports the metadata back in `artifacts`. The bytes stay on the node; Switchyard pulls them over the token-authenticated client and stores them as task attachments.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NODE_AGENT_ARTIFACT_DIR` | `$TMPDIR/node-agent-artifacts` | Where the server stores artifacts, one directory per task. |
+| `NODE_AGENT_JOB_ARTIFACT_DIR` | *(unset)* | Set per job from `artifact_dir`; the agent uploads from here. |
+
+Limits: 5 MB per file, 30 MB per task, swept after 7 days. Uploads are treated as untrusted — the declared content type is ignored in favour of sniffing the bytes, the stored filename is generated rather than taken from the upload, and a client-supplied path never reaches the filesystem. Files outside the image/PDF allowlist are rejected, so a `.zip` will not be stored.
 
 The agent never commits or pushes as part of a Switchyard dispatch. Switchyard fetches the diff and performs approval through its review gate.
 
@@ -350,6 +398,40 @@ Verify the path in `workspaces.json` is a prefix of the task path. Slash differe
 
 Linux and macOS require `cmd` or `command-code`. Windows requires `cmdc` or `command-code`. Run `cmd --version`, `cmdc --version`, or `command-code --version` locally as the service user.
 
+### `omp_unavailable:` or an omp run that makes no edits
+
+`omp_unavailable:` means the binary is not on the worker's PATH. Run
+`omp --version` as the service user. The worker probes `omp` but never installs
+it:
+
+```sh
+# macOS / Linux
+curl -fsSL https://omp.sh/install | sh
+```
+
+```powershell
+# Windows
+irm https://omp.sh/install.ps1 | iex
+```
+
+If the installer aborts with a `Bun 1.3.14 or newer is required` error, the host
+has an older `bun` (for example a bundled Kiro-Cli copy). Skip the source path
+and take the prebuilt binary:
+
+```powershell
+& ([scriptblock]::Create((irm https://omp.sh/install.ps1))) -Binary
+```
+
+A run that starts but edits nothing usually means no provider is configured —
+omp exits early with `No models available`. omp keeps credentials in its own
+store, **not** in the node-agent environment, so a host with working `dsh` and
+`codex` can still have none usable for omp. Run `omp setup` as the service user,
+or put a provider key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) into the service
+environment and restart. The worker does not pass `--model`, so a board-level
+`model` is ignored for omp.
+
+Restart the worker after installing so it re-advertises its capabilities.
+
 ### `dsh_session_conflict`
 
 Something else owns the session's DSH write handle — normally `dsh web` running
@@ -377,6 +459,9 @@ registry entry still does not appear — see
 - [Switchyard](https://github.com/adityahimaone/switchyard) — control plane, dispatcher, and review gate
 - [CommandCode CLI reference](https://commandcode.ai/docs/reference/cli)
 - [CommandCode headless mode](https://commandcode.ai/docs/headless)
+- [omp (oh-my-pi)](https://omp.sh) — coding agent with the IDE wired in
+- [omp CLI reference](https://omp.sh/docs/cli)
+- [omp executor contract](docs/omp-harness.md) — invocation, session identity, install, troubleshooting
 - [DeepSeek Harness executor contract](docs/dsh-harness.md) — session identity, isolated home, publishing
 - [RTK](https://github.com/rtk-ai/rtk) — command output reduction
 - [Caveman](https://github.com/JuliusBrussee/caveman) — result compression target

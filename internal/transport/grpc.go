@@ -11,14 +11,14 @@ import (
 const GRPCServiceName = "nodeagent.v1.NodeAgentService"
 
 type RegisterFrame struct {
-	NodeID     string            `json:"node_id"`
-	Hostname   string            `json:"hostname"`
-	Version    string            `json:"version"`
-	Workspaces []string          `json:"workspaces"`
-	Executors  []string          `json:"executors,omitempty"`
-	Versions   map[string]string `json:"versions,omitempty"`
+	NodeID     string               `json:"node_id"`
+	Hostname   string               `json:"hostname"`
+	Version    string               `json:"version"`
+	Workspaces []string             `json:"workspaces"`
+	Executors  []string             `json:"executors,omitempty"`
+	Versions   map[string]string    `json:"versions,omitempty"`
 	DSHHealth  *heartbeat.DSHHealth `json:"dsh_health,omitempty"`
-	Transports []string          `json:"transports,omitempty"`
+	Transports []string             `json:"transports,omitempty"`
 }
 type HeartbeatFrame struct {
 	NodeID string `json:"node_id"`
@@ -44,7 +44,15 @@ type JobResult struct {
 	DurationMs     int64  `json:"duration_ms"`
 	DSHSessionID   string `json:"dsh_session_id,omitempty"`
 	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
-	LastTurnSeq    *int64 `json:"last_turn_seq,omitempty"`
+	// CommandCodeSessionID and OMPSessionID carry non-dsh harness continuity.
+	// Without them a continuation would arrive with no session to resume.
+	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
+	OMPSessionID         string `json:"omp_session_id,omitempty"`
+	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
+	// Artifacts mirrors ResultRequest.Artifacts so the gRPC lane carries the
+	// same evidence as the HTTP lane — otherwise which transport a node
+	// negotiated would decide whether a card arrives with screenshots.
+	Artifacts []Artifact `json:"artifacts,omitempty"`
 }
 type WorkerFrame struct {
 	Register    *RegisterFrame  `json:"register,omitempty"`
@@ -75,6 +83,9 @@ type DispatchJob struct {
 	PrequestNote         string `json:"prequest_note"`
 	DSHSessionID         string `json:"dsh_session_id,omitempty"`
 	DSHWorkspaceID       string `json:"dsh_workspace_id,omitempty"`
+	HarnessKind          string `json:"harness_kind,omitempty"`
+	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
+	OMPSessionID         string `json:"omp_session_id,omitempty"`
 	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
 	LastCommentID        *int64 `json:"last_comment_id,omitempty"`
 	RunID                string `json:"run_id,omitempty"`

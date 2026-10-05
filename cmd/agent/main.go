@@ -277,15 +277,17 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
 		})
 		dur := time.Since(start).Milliseconds()
 		atomic.StoreInt32(&busy, 0)
-		res := dshResult(transport.DispatchRequest{TaskID: job.TaskID, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq}, output, ok, errStr, dur)
-		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: res.TaskID, Success: res.Success, Output: res.Output, Error: res.Error, DurationMs: res.DurationMs, DSHSessionID: res.DSHSessionID, DSHWorkspaceID: res.DSHWorkspaceID, LastTurnSeq: res.LastTurnSeq}}); err != nil {
+		// Executor and the harness session fields must survive into the result or a
+		// continuation cannot prove which session it belongs to.
+		res := dshResult(transport.DispatchRequest{TaskID: job.TaskID, Executor: job.Executor, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, LastTurnSeq: job.LastTurnSeq}, output, ok, errStr, dur)
+		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: res.TaskID, Success: res.Success, Output: res.Output, Error: res.Error, DurationMs: res.DurationMs, DSHSessionID: res.DSHSessionID, DSHWorkspaceID: res.DSHWorkspaceID, CommandCodeSessionID: res.CommandCodeSessionID, OMPSessionID: res.OMPSessionID, LastTurnSeq: res.LastTurnSeq}}); err != nil {
 			return err
 		}
 		_ = stream.Send(&transport.WorkerFrame{Heartbeat: &transport.HeartbeatFrame{NodeID: nodeID, Status: "idle"}})
@@ -447,6 +449,38 @@ func agenticJobTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+// jobDeadline resolves how long this job may run: the per-dispatch override when
+// the control plane sent one, otherwise the executor's default.
+//
+// The override is clamped so a bad or hostile value cannot produce a deadline
+// measured in years, and cannot shorten a job below a floor that would kill
+// every legitimate run.
+func jobDeadlineFor(job transport.DispatchRequest, agentic bool) time.Duration {
+	def := jobTimeout()
+	if agentic {
+		def = agenticJobTimeout()
+	}
+	if job.TimeoutS <= 0 {
+		return def
+	}
+	d := time.Duration(job.TimeoutS) * time.Second
+	if d < minJobTimeout {
+		return def
+	}
+	if d > maxJobTimeout {
+		return maxJobTimeout
+	}
+	return d
+}
+
+const (
+	// A run shorter than this is not a run; something in the chain is broken.
+	minJobTimeout = 60 * time.Second
+	// An upper clamp, so a mistyped timeout cannot pin a node's single poll loop
+	// to a job that will outlive the control plane's patience for it.
+	maxJobTimeout = 6 * time.Hour
+)
+
 var convStore *conversation.Store
 
 func initConvStore() error {
@@ -584,10 +618,22 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		}
 	}
 
-	jobDeadline := jobTimeout()
+	jobDeadline := jobDeadlineFor(job, agentic)
 	if agentic {
-		jobDeadline = agenticJobTimeout()
 		job.Message = prompt
+	}
+	// Point the run at its artifact directory so anything it produces is
+	// uploaded with the result. Set per job and cleared afterwards, because the
+	// agent handles one job at a time.
+	if dir := jobArtifactDir(job); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Printf("artifact dir %s: %v", dir, err)
+		}
+		if os.Getenv("NODE_AGENT_JOB_ARTIFACT_DIR") != dir {
+			// Defer rather than unset now: dshResult runs after this function
+			// returns and reads it.
+			defer os.Setenv("NODE_AGENT_JOB_ARTIFACT_DIR", dir)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), jobDeadline)
 	defer cancel()
@@ -638,7 +684,7 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 				hermesPrompt = conversation.BuildPrompt(ctxMsgs, prompt)
 			}
 		}
-		cmd = exec.CommandContext(ctx, bin, "chat", "-q", hermesPrompt)
+		cmd = commandFor(ctx, bin, "chat", "-q", hermesPrompt)
 		cmd.Env = resolvedEnv
 	case "codex":
 		bin := findBin("codex")
@@ -648,7 +694,7 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		resolvedBin = bin
 		resolvedBin = bin
 		resolvedArgs = []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--color", "never"}
-		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
+		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 	case "dsh":
 		bin := findBin("dsh")
 		if bin == "" {
@@ -671,7 +717,7 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		if strings.TrimSpace(job.DSHSessionID) != "" {
 			adoptLegacyDSHSession(job.DSHSessionID, ws)
 		}
-		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
+		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 		// launchd PATH omits Homebrew; dsh's shebang resolves node through env.
 		cmd.Env = dshCommandEnv()
 		if strings.TrimSpace(job.Model) != "" {
@@ -697,7 +743,23 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 			jsonOutput = cached
 		}
 		resolvedArgs = commandCodeArgs(job, jsonOutput)
-		cmd = exec.CommandContext(ctx, bin, append(resolvedArgs, prompt)...)
+		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
+		// The launcher is a node script on macOS; give it a PATH that has node.
+		cmd.Env = nodeLauncherEnv()
+	case "omp":
+		bin := ompBin()
+		if bin == "" {
+			return "", false, "omp_unavailable: omp not installed or not on PATH"
+		}
+		// A requested continuation must actually be honored. Silently starting a
+		// fresh session would re-apply the same feedback to files the previous
+		// turn already edited, so refuse instead of downgrading to a cold run.
+		if job.SessionContinuation && strings.TrimSpace(job.OMPSessionID) == "" {
+			return "", false, "omp_session_missing: continuation requested but no session id was dispatched (worker/control-plane version mismatch?)"
+		}
+		resolvedBin = bin
+		resolvedArgs = ompArgs(job)
+		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 	case "auto":
 		// Auto preserves the historical preference but remains explicit in the result.
 		if findBin("hermes") != "" {
@@ -710,6 +772,10 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		}
 		if commandCodeBin() != "" {
 			job.Executor = "commandcode"
+			return runJobWithProgress(job, onProgress)
+		}
+		if ompBin() != "" {
+			job.Executor = "omp"
 			return runJobWithProgress(job, onProgress)
 		}
 		return "", false, "executor_unavailable: auto found no AI executor"
@@ -727,8 +793,9 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		commandCodeRememberJSONSupport(resolvedBin, false)
 		fallbackArgs := commandCodeArgs(job, false)
 		resolvedArgs = fallbackArgs
-		retry := exec.CommandContext(ctx, resolvedBin, append(fallbackArgs, prompt)...)
+		retry := commandFor(ctx, resolvedBin, append(fallbackArgs, prompt)...)
 		retry.Dir = ws
+		retry.Env = nodeLauncherEnv()
 		emit("process_spawned", "Retrying Command Code without --output-format json")
 		out, err = streamCommand(retry, job.TaskID)
 	}
@@ -750,6 +817,17 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	commandCodeSessionID, _, _ := parseCommandCodeResultEvent(out)
 	if executor == "commandcode" && commandCodeSessionID == "" {
 		commandCodeSessionID = strings.TrimSpace(job.CommandCodeSessionID)
+	}
+	// omp reports identity on whichever frame resolves the session, not on a
+	// dedicated result frame. Scoped to the omp executor on purpose: its parser
+	// accepts any frame carrying a sessionId, and Command Code frames carry one
+	// too, so an unscoped call would stamp omp_session_id onto a commandcode run.
+	ompSessionID := ""
+	if executor == "omp" {
+		ompSessionID = parseOmpSessionID(out)
+		if ompSessionID == "" {
+			ompSessionID = strings.TrimSpace(job.OMPSessionID)
+		}
 	}
 	if executor == "dsh" && sessionID != "" && os.Getenv("NODE_AGENT_DSH_WORKSPACE_REGISTRATION") != "0" {
 		if registrationErr := registerDeepSeekHarnessWorkspace(ws, sessionID); registrationErr != nil {
@@ -779,10 +857,18 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	if commandCodeSessionID != "" {
 		provenance += fmt.Sprintf(" commandcode_session_id=%s", commandCodeSessionID)
 	}
+	if ompSessionID != "" {
+		provenance += fmt.Sprintf(" omp_session_id=%s", ompSessionID)
+	}
 	// A successful JSON run must prove identity so the control plane can bind it.
 	// A text-mode fallback legitimately cannot, and is treated as a first run.
 	if executor == "commandcode" && commandCodeSessionID == "" && err == nil && commandCodeJSONOutputRequested(resolvedArgs) {
 		return string(out), false, "commandcode_session_missing: headless --output-format json returned no result frame"
+	}
+	// omp always runs in --mode json, so a success without a session id means the
+	// run never proved identity and the card must not be bound to a guessed id.
+	if executor == "omp" && ompSessionID == "" && err == nil {
+		return string(out), false, "omp_session_missing: headless --mode json returned no session id"
 	}
 	if executor == "dsh" && sessionID == "" && err == nil {
 		return string(out), false, "dsh_session_missing: headless --json returned no session event"
@@ -814,7 +900,19 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 }
 
 func dshResult(job transport.DispatchRequest, output string, ok bool, errStr string, durationMs int64) transport.ResultRequest {
-	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, CommandCodeSessionID: job.CommandCodeSessionID}
+	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID}
+	// Upload anything the run left in its artifact dir, so the control plane can
+	// attach it to the card. Best-effort: a missing screenshot must not turn a
+	// passing run into a failed one, so a failure here is logged, not fatal.
+	result.Artifacts = uploadJobArtifacts(job)
+	if job.Executor == "omp" {
+		// omp emits no turn counter, so LastTurnSeq stays nil and the control
+		// plane falls back to its run-ownership fence.
+		if sessionID := parseOmpSessionID([]byte(output)); sessionID != "" {
+			result.OMPSessionID = sessionID
+		}
+		return result
+	}
 	if job.Executor == "commandcode" {
 		// Command Code emits no turn counter, so LastTurnSeq stays nil and the
 		// control plane falls back to its run-ownership fence.
@@ -1308,11 +1406,115 @@ func validateShellCommand(command, workspace string) error {
 	return nil
 }
 
+// commandCodeBin resolves the Command Code CLI. On Windows `cmd` is the built-in
+// shell, not Command Code, so it must never be probed there or the worker would
+// try to drive cmd.exe as an agent.
 func commandCodeBin() string {
 	if runtime.GOOS == "windows" {
 		return findBinAny("cmdc", "command-code")
 	}
 	return findBinAny("cmd", "command-code")
+}
+
+// commandCodeBinNames lists the same candidates commandCodeBin resolves, in the
+// same order. detectExecutors must advertise exactly what execution will run:
+// probing `cmd` on Windows always finds cmd.exe and reports the shell banner as
+// if it were the agent's version.
+func commandCodeBinNames() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmdc", "command-code"}
+	}
+	return []string{"cmd", "command-code"}
+}
+
+// ompBin resolves the oh-my-pi coding agent. The binary ships under the same
+// name on every platform, so no per-OS alias is needed.
+func ompBin() string {
+	return findBin("omp")
+}
+
+// npmShimEntry is a Windows npm launcher resolved past its `.cmd` shim.
+type npmShimEntry struct {
+	// Entry is the JavaScript module to run, e.g. .../dist/index.mjs.
+	Entry string
+	// Node is the node executable used to run it.
+	Node string
+}
+
+// resolveNpmShim turns an npm `.cmd`/`.ps1` launcher into the node invocation it
+// wraps.
+//
+// Every npm install on Windows drops three launchers side by side: an
+// extensionless `#!/bin/sh` script, a `.ps1`, and a `.cmd` batch file. All three
+// live under a space-containing path such as "C:\Program Files\nodejs", and none
+// of them can be executed by the Go worker: the batch shim re-splits the path
+// ("'C:\Program' is not recognized as an internal or external command"), the
+// POSIX script is not a Windows executable, and quoting through `cmd /c` loses
+// the quotes again as soon as an argument contains a space — which every Kanban
+// prompt does. Running the underlying module through node avoids all of it.
+func resolveNpmShim(bin string) (npmShimEntry, bool) {
+	if runtime.GOOS != "windows" {
+		return npmShimEntry{}, false
+	}
+	ext := strings.ToLower(filepath.Ext(bin))
+	if ext != ".cmd" && ext != ".bat" && ext != "" {
+		return npmShimEntry{}, false
+	}
+	// <prefix>/node_modules/<pkg>/dist/index.mjs, where <prefix> is the
+	// directory holding the shim.
+	prefix := filepath.Dir(strings.TrimSuffix(bin, filepath.Ext(bin)))
+	// Prefer the node.exe that ships beside the shim. A PATH lookup can land on
+	// a version manager (Volta) whose shim resolves the module differently and
+	// then hands the CLI an empty query.
+	node := filepath.Join(prefix, "node.exe")
+	if st, err := os.Stat(node); err != nil || st.IsDir() {
+		if node = findBin("node"); node == "" {
+			return npmShimEntry{}, false
+		}
+	}
+	modules := filepath.Join(prefix, "node_modules")
+	entries, err := os.ReadDir(modules)
+	if err != nil {
+		return npmShimEntry{}, false
+	}
+	// npm links global packages as direct children of node_modules.
+	pkgName := strings.TrimSuffix(filepath.Base(bin), filepath.Ext(bin))
+	if strings.EqualFold(pkgName, "cmdc") {
+		pkgName = "command-code"
+	}
+	var candidates []npmShimEntry
+	for _, dir := range entries {
+		if !dir.IsDir() {
+			continue
+		}
+		entry := npmPackageEntry(filepath.Join(modules, dir.Name()))
+		if entry == "" {
+			continue
+		}
+		resolved := npmShimEntry{Entry: entry, Node: node}
+		// Prefer the package the shim name points at.
+		if strings.EqualFold(dir.Name(), pkgName) {
+			return resolved, true
+		}
+		candidates = append(candidates, resolved)
+	}
+	// An unusual alias still resolves when exactly one package exposes a module.
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	return npmShimEntry{}, false
+}
+
+// npmPackageEntry returns the module a global npm package exposes, preferring
+// the conventional dist/index.mjs.
+func npmPackageEntry(pkgDir string) string {
+	for _, rel := range []string{filepath.Join("dist", "index.mjs"), filepath.Join("dist", "cli.mjs"), "index.mjs"} {
+		p := filepath.Join(pkgDir, rel)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
 }
 
 func findBinAny(names ...string) string {
@@ -1324,6 +1526,22 @@ func findBinAny(names ...string) string {
 	return ""
 }
 
+// commandFor builds the exec.Cmd that runs an agent binary.
+//
+// On Windows an npm-installed agent is only reachable through a `.cmd` shim in a
+// space-containing path, which no quoting scheme survives once an argument has a
+// space — and Kanban prompts always do. Such a shim is therefore resolved to the
+// node invocation it wraps (see resolveNpmShim). Everything else runs directly.
+func commandFor(ctx context.Context, bin string, args ...string) *exec.Cmd {
+	if shim, ok := resolveNpmShim(bin); ok {
+		nodeArgs := make([]string, 0, len(args)+1)
+		nodeArgs = append(nodeArgs, shim.Entry)
+		nodeArgs = append(nodeArgs, args...)
+		return exec.CommandContext(ctx, shim.Node, nodeArgs...)
+	}
+	return exec.CommandContext(ctx, bin, args...)
+}
+
 func detectExecutors() ([]string, map[string]string) {
 	checks := []struct {
 		name string
@@ -1331,7 +1549,8 @@ func detectExecutors() ([]string, map[string]string) {
 	}{
 		{"hermes", []string{"hermes"}}, {"codex", []string{"codex"}},
 		{"dsh", []string{"dsh"}},
-		{"commandcode", []string{"cmd", "cmdc", "command-code"}},
+		{"commandcode", commandCodeBinNames()},
+		{"omp", []string{"omp"}},
 	}
 	var out []string
 	versions := map[string]string{}
@@ -1339,9 +1558,13 @@ func detectExecutors() ([]string, map[string]string) {
 		if bin := findBinAny(c.bins...); bin != "" {
 			out = append(out, c.name)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			cmd := exec.CommandContext(ctx, bin, "--version")
+			cmd := commandFor(ctx, bin, "--version")
 			if c.name == "dsh" {
 				cmd.Env = dshCommandEnv()
+			}
+			if c.name == "commandcode" {
+				// Same node-on-PATH requirement as the run itself.
+				cmd.Env = nodeLauncherEnv()
 			}
 			b, _ := cmd.CombinedOutput()
 			cancel()
@@ -1504,6 +1727,15 @@ func dshWebAvailable() bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode >= 200 && resp.StatusCode < 500
+}
+
+// nodeLauncherEnv widens PATH for node-backed launchers. On macOS the
+// Command Code `cmd` is a Homebrew symlink to an .mjs file with a `#!/usr/bin/env
+// node` shebang, and launchd starts the worker with a minimal PATH, so the
+// version probe and every run failed with "env: node: No such file or directory".
+// Mirrors the DSH fix, which prepends the same prefixes.
+func nodeLauncherEnv() []string {
+	return append(os.Environ(), "PATH=/opt/homebrew/bin:/usr/local/bin:"+os.Getenv("PATH"))
 }
 
 func dshCommandEnv() []string {
@@ -2136,6 +2368,61 @@ func parseCommandCodeResultEvent(raw []byte) (string, string, bool) {
 		hasUsage = event.Usage != nil
 	}
 	return sessionID, finalText, hasUsage
+}
+
+// ompArgs builds the headless oh-my-pi invocation. A first run omits --resume
+// so the CLI mints a real session and returns its id; a continuation resumes the
+// exact session the control plane bound to this card. --mode json makes the run
+// emit NDJSON so the worker can prove session identity, and --auto-approve
+// removes the interactive approval prompt a headless worker cannot answer.
+func ompArgs(job transport.DispatchRequest) []string {
+	args := []string{"-p", "--auto-approve", "--mode", "json"}
+	if sessionID := strings.TrimSpace(job.OMPSessionID); sessionID != "" {
+		args = append(args, "--resume", sessionID)
+	}
+	return args
+}
+
+// ompSessionFrame matches the session identity that any `omp --mode json` frame
+// may carry. omp spreads it across different frame types (a top-level sessionId
+// on state/result frames, a nested one on open_session data), so the extractor
+// probes both rather than binding to one frame schema.
+type ompSessionFrame struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionId"`
+	Data      *struct {
+		SessionID string `json:"sessionId"`
+	} `json:"data"`
+}
+
+// parseOmpSessionID extracts the session id from omp's NDJSON output. It is
+// deliberately tolerant: any frame carrying a session id counts, because a
+// version that renames or reshapes frames must degrade to "unknown session"
+// rather than fail a run that actually succeeded. Provenance and proof lines
+// are not JSON and are skipped.
+func parseOmpSessionID(raw []byte) string {
+	sessionID := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var frame ompSessionFrame
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			// A partially streamed trailing line lands here; the next poll re-parses it.
+			continue
+		}
+		if id := strings.TrimSpace(frame.SessionID); id != "" {
+			sessionID = id
+			continue
+		}
+		if frame.Data != nil {
+			if id := strings.TrimSpace(frame.Data.SessionID); id != "" {
+				sessionID = id
+			}
+		}
+	}
+	return sessionID
 }
 
 // commandCodeRejectsJSONOutput detects a CLI build that predates

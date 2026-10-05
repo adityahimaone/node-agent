@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"strings"
 	"testing"
 
 	"node-agent/internal/heartbeat"
@@ -8,6 +10,91 @@ import (
 
 func node(id string, status string, executors []string, workspaces ...string) *heartbeat.Node {
 	return &heartbeat.Node{NodeID: id, Status: status, Executors: executors, Workspaces: workspaces}
+}
+
+// pickDispatchNode is the handler's decision. Every outcome is
+// testable here: the match, both 409s, the no-workspace fallback
+// and the 503.
+func TestPickDispatchNodeMatchesWorkspaceAndExecutor(t *testing.T) {
+	nodes := []*heartbeat.Node{
+		node("mac", "idle", []string{"shell"}, "/ws"),
+		node("other", "idle", []string{"hermes"}, "/ws"),
+	}
+	id, status, err := pickDispatchNode(nodes, "/ws/sub", "shell")
+	if err != nil || status != 0 || id != "mac" {
+		t.Fatalf("expected mac, got id=%q status=%d err=%v", id, status, err)
+	}
+}
+
+func TestPickDispatchNodeExecutorUnavailableOnOwner(t *testing.T) {
+	nodes := []*heartbeat.Node{
+		node("other", "idle", []string{"hermes"}, "/ws"),
+	}
+	id, status, err := pickDispatchNode(nodes, "/ws", "shell")
+	if id != "" || status != http.StatusConflict || err == nil {
+		t.Fatalf("expected 409, got id=%q status=%d err=%v", id, status, err)
+	}
+	if want := "executor unavailable on node(s) owning workspace: shell"; err.Error() != want {
+		t.Fatalf("message = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestPickDispatchNodeNoOwner(t *testing.T) {
+	nodes := []*heartbeat.Node{
+		node("mac", "idle", []string{"shell"}, "/elsewhere"),
+	}
+	id, status, err := pickDispatchNode(nodes, "/ws", "shell")
+	if id != "" || status != http.StatusConflict || err == nil {
+		t.Fatalf("expected 409, got id=%q status=%d err=%v", id, status, err)
+	}
+	if !strings.Contains(err.Error(), `no node owns workspace "/ws"`) || !strings.Contains(err.Error(), "registered: mac:/elsewhere") {
+		t.Fatalf("message must name the workspace and the registered list, got %q", err.Error())
+	}
+}
+
+// The no-workspace fallback must not depend on reg.List()'s map
+// order: the lowest online node id wins, every call.
+func TestPickDispatchNodeNoWorkspacePicksLowestOnline(t *testing.T) {
+	nodes := []*heartbeat.Node{
+		node("zeta", "idle", []string{"shell"}, "/z"),
+		node("alpha", "idle", []string{"shell"}, "/a"),
+		node("mid", "idle", []string{"shell"}),
+	}
+	first, status, err := pickDispatchNode(nodes, "", "shell")
+	if err != nil || status != 0 || first != "alpha" {
+		t.Fatalf("expected alpha, got %q status=%d err=%v", first, status, err)
+	}
+	for i := 0; i < 50; i++ {
+		got, _, err := pickDispatchNode(nodes, "", "shell")
+		if err != nil || got != first {
+			t.Fatalf("fallback unstable: first=%q got=%q err=%v", first, got, err)
+		}
+	}
+}
+
+func TestPickDispatchNodeNoWorkspaceSkipsOffline(t *testing.T) {
+	nodes := []*heartbeat.Node{
+		node("aaa", "offline", []string{"shell"}),
+		node("zzz", "idle", []string{"shell"}),
+	}
+	id, status, err := pickDispatchNode(nodes, "", "shell")
+	if err != nil || status != 0 || id != "zzz" {
+		t.Fatalf("expected zzz (offline skipped), got %q status=%d err=%v", id, status, err)
+	}
+}
+
+func TestPickDispatchNodeEmptyRegistry(t *testing.T) {
+	// No workspace to route on and no node to fall back to: the 503.
+	id, status, err := pickDispatchNode(nil, "", "shell")
+	if id != "" || status != http.StatusServiceUnavailable || err == nil || err.Error() != "no nodes available" {
+		t.Fatalf("expected 503 no nodes available, got id=%q status=%d err=%v", id, status, err)
+	}
+	// An unroutable workspace on an empty registry is the 409 no-owner
+	// rejection, not the 503 — the workspace is the problem.
+	id, status, err = pickDispatchNode(nil, "/ws", "shell")
+	if id != "" || status != http.StatusConflict || err == nil {
+		t.Fatalf("expected 409, got id=%q status=%d err=%v", id, status, err)
+	}
 }
 
 // The reported bug: a macOS workspace that no node registered used to fall

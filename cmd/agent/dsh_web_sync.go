@@ -237,4 +237,3 @@ func syncDSHWebSessionOnce(ctx context.Context, sessionID, workspacePath string)
 	}
 	return nil
 }
-

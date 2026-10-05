@@ -132,7 +132,7 @@ func (grpcService) Connect(stream transport.NodeAgentService_ConnectServer) erro
 				// Mirror into the HTTP results store so GET /api/results/{task_id}
 				// (kanban polling) works identically for both lanes.
 				rmu.Lock()
-				results[f.JobResult.TaskID] = storedResult{res: transport.ResultRequest{TaskID: f.JobResult.TaskID, Success: f.JobResult.Success, Output: f.JobResult.Output, Error: f.JobResult.Error, DurationMs: f.JobResult.DurationMs, DSHSessionID: f.JobResult.DSHSessionID, DSHWorkspaceID: f.JobResult.DSHWorkspaceID, LastTurnSeq: f.JobResult.LastTurnSeq}, at: time.Now()}
+				results[f.JobResult.TaskID] = storedResult{res: transport.ResultRequest{TaskID: f.JobResult.TaskID, Success: f.JobResult.Success, Output: f.JobResult.Output, Error: f.JobResult.Error, DurationMs: f.JobResult.DurationMs, DSHSessionID: f.JobResult.DSHSessionID, DSHWorkspaceID: f.JobResult.DSHWorkspaceID, CommandCodeSessionID: f.JobResult.CommandCodeSessionID, OMPSessionID: f.JobResult.OMPSessionID, LastTurnSeq: f.JobResult.LastTurnSeq, Artifacts: f.JobResult.Artifacts}, at: time.Now()}
 				rmu.Unlock()
 				log.Printf("grpc result %s success=%v %dms", f.JobResult.TaskID, f.JobResult.Success, f.JobResult.DurationMs)
 			}
@@ -152,7 +152,7 @@ func dispatchGRPC(req transport.DispatchRequest, nodeID string) (string, bool) {
 		return "", false
 	}
 	d := deliveries.NewDelivery(req.TaskID, req.Board, req.Workspace)
-	job := &transport.ServerFrame{DispatchJob: &transport.DispatchJob{DeliveryID: d.ID, Attempt: 1, TaskID: req.TaskID, Board: req.Board, Message: req.Message, Workspace: req.Workspace, Executor: req.Executor, Command: req.Command, ExecutionMode: req.ExecutionMode, NoRTK: req.NoRTK, MaxIterations: req.MaxIterations, Acceptance: req.Acceptance, Model: req.Model, Provider: req.Provider, PrequestNote: req.PrequestNote, DSHSessionID: req.DSHSessionID, DSHWorkspaceID: req.DSHWorkspaceID, LastTurnSeq: req.LastTurnSeq, LastCommentID: req.LastCommentID, RunID: req.RunID, SessionContinuation: req.SessionContinuation, ConversationID: req.ConversationID, AppendOnly: req.AppendOnly, ContextWindow: req.ContextWindow, LeaseExpiresAtUnixMs: d.ExpiresAt.UnixMilli()}}
+	job := &transport.ServerFrame{DispatchJob: &transport.DispatchJob{DeliveryID: d.ID, Attempt: 1, TaskID: req.TaskID, Board: req.Board, Message: req.Message, Workspace: req.Workspace, Executor: req.Executor, Command: req.Command, ExecutionMode: req.ExecutionMode, NoRTK: req.NoRTK, MaxIterations: req.MaxIterations, Acceptance: req.Acceptance, Model: req.Model, Provider: req.Provider, PrequestNote: req.PrequestNote, DSHSessionID: req.DSHSessionID, DSHWorkspaceID: req.DSHWorkspaceID, HarnessKind: req.HarnessKind, CommandCodeSessionID: req.CommandCodeSessionID, OMPSessionID: req.OMPSessionID, LastTurnSeq: req.LastTurnSeq, LastCommentID: req.LastCommentID, RunID: req.RunID, SessionContinuation: req.SessionContinuation, ConversationID: req.ConversationID, AppendOnly: req.AppendOnly, ContextWindow: req.ContextWindow, LeaseExpiresAtUnixMs: d.ExpiresAt.UnixMilli()}}
 	select {
 	case s.out <- job:
 		log.Printf("grpc dispatch %s -> %s delivery=%s", req.TaskID, nodeID, d.ID)

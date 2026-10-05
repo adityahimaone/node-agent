@@ -37,7 +37,7 @@ type DispatchRequest struct {
 	Workspace     string `json:"workspace"` // absolute path on agent
 	Model         string `json:"model"`
 	Provider      string `json:"provider"`
-	Executor      string `json:"executor,omitempty"`       // auto|hermes|codex|commandcode|shell
+	Executor      string `json:"executor,omitempty"`       // auto|hermes|codex|commandcode|omp|shell
 	Command       string `json:"command,omitempty"`        // only used by shell executor
 	ExecutionMode string `json:"execution_mode,omitempty"` // direct|agentic
 	NoRTK         bool   `json:"no_rtk,omitempty"`         // preserve machine-readable command output
@@ -49,19 +49,31 @@ type DispatchRequest struct {
 	// DSHSessionID resumes same DeepSeek Harness session for task comments.
 	DSHSessionID   string `json:"dsh_session_id,omitempty"`
 	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
-	// HarnessKind names the continuity harness ("dsh" or "commandcode").
+	// HarnessKind names the continuity harness ("dsh", "commandcode" or "omp").
 	HarnessKind string `json:"harness_kind,omitempty"`
 	// CommandCodeSessionID resumes the same Command Code session for task comments.
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
-	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
-	LastCommentID        *int64 `json:"last_comment_id,omitempty"`
-	RunID                string `json:"run_id,omitempty"`
-	SessionContinuation  bool   `json:"session_continuation,omitempty"`
+	// OMPSessionID resumes the same omp session for task comments.
+	OMPSessionID        string `json:"omp_session_id,omitempty"`
+	LastTurnSeq         *int64 `json:"last_turn_seq,omitempty"`
+	LastCommentID       *int64 `json:"last_comment_id,omitempty"`
+	RunID               string `json:"run_id,omitempty"`
+	SessionContinuation bool   `json:"session_continuation,omitempty"`
 	// Persistent chat. ConversationID empty => server/agent auto-resolves per
 	// workspace. AppendOnly=false means reset context before this message.
 	ConversationID string `json:"conversation_id,omitempty"`
 	AppendOnly     bool   `json:"append_only,omitempty"`
 	ContextWindow  int    `json:"context_window,omitempty"`
+	// TimeoutS overrides the job timeout for this dispatch, in seconds.
+	//
+	// It exists because one class of job legitimately outlasts the default: a
+	// visual suite signs in, walks every page in both themes and runs a full axe
+	// scan, which can run well past 600s on a cold start. Raising the global
+	// default instead would make every hung job wait an hour to be noticed.
+	TimeoutS int `json:"timeout_s,omitempty"`
+	// ArtifactDir is a per-job directory the agent uploads to before posting its
+	// result. Empty for every job that produces no artifacts.
+	ArtifactDir string `json:"artifact_dir,omitempty"`
 }
 
 // Progress — agent -> server. Sent while executor is still running.
@@ -81,7 +93,26 @@ type ResultRequest struct {
 	DSHWorkspaceID string `json:"dsh_workspace_id,omitempty"`
 	// CommandCodeSessionID is the Command Code session this run belongs to.
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
-	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
+	// OMPSessionID is the omp session this run belongs to.
+	OMPSessionID string `json:"omp_session_id,omitempty"`
+	LastTurnSeq  *int64 `json:"last_turn_seq,omitempty"`
+	// Artifacts are files the run produced, already stored on this node. Only
+	// the metadata rides along here; the control plane pulls the bytes over the
+	// artifact endpoint. See cmd/server/artifacts.go.
+	Artifacts []Artifact `json:"artifacts,omitempty"`
+}
+
+// Artifact is one file stored for a task, as reported in a result.
+//
+// Name is the generated on-disk filename and is the only handle a client gets —
+// Path is informational. Together they are what lets the control plane fetch a
+// file without ever naming a path of its own.
+type Artifact struct {
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
+	MIME   string `json:"mime"`
 }
 
 func WriteJSON(w http.ResponseWriter, code int, v any) {

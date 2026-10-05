@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -157,6 +158,7 @@ func main() {
 	}
 
 	go cleanupResults()
+	go cleanupArtifacts()
 
 	// Conversation store for server-side conversation management API.
 	home := os.Getenv("HOME")
@@ -235,6 +237,11 @@ func main() {
 		log.Printf("result %s from %s success=%v %dms", req.TaskID, id, req.Success, req.DurationMs)
 		transport.WriteJSON(w, 200, map[string]string{"status": "ok"})
 	})
+	// Artifact transport. Uploads and downloads are token-guarded like every
+	// other route, and the task id is validated into a directory before it
+	// touches the filesystem — see artifacts.go.
+	r.Post("/api/nodes/artifacts/{task_id}", handleArtifactUpload)
+	r.Get("/api/nodes/artifacts/{task_id}/{name}", handleArtifactDownload)
 	r.Post("/api/nodes/progress", func(w http.ResponseWriter, r *http.Request) {
 		var req transport.ProgressRequest
 		if err := transport.ReadJSON(r, &req); err != nil || req.TaskID == "" {
@@ -290,31 +297,12 @@ func main() {
 		// error: falling back to an arbitrary online node used to silently run
 		// macOS workspaces on the Windows node, which failed much later with
 		// "workspace not found" and surfaced to callers as an empty result.
-		nodes := reg.List()
-		nodeID := ""
-		if req.Workspace != "" {
-			n := selectNodeForWorkspace(nodes, req.Workspace, executor)
-			if n != nil {
-				nodeID = n.NodeID
-			} else if owners := knownWorkspaceOwners(nodes, req.Workspace); len(owners) > 0 {
-				http.Error(w, "executor unavailable on node(s) owning workspace: "+executor, 409)
-				return
-			} else {
-				http.Error(w, fmt.Sprintf("no node owns workspace %q (registered: %s)", req.Workspace, registeredWorkspaceList(nodes)), 409)
-				return
-			}
-		} else {
-			// No workspace to match on: any online node will do, but keep the
-			// choice deterministic.
-			for _, n := range nodes {
-				if n.Status != "offline" {
-					nodeID = n.NodeID
-					break
-				}
-			}
-		}
-		if nodeID == "" {
-			http.Error(w, "no nodes available", 503)
+		// The decision itself lives in pickDispatchNode so every outcome —
+		// the match, both 409s, the no-workspace fallback and the 503 — is
+		// testable without HTTP scaffolding.
+		nodeID, status, pickErr := pickDispatchNode(reg.List(), req.Workspace, executor)
+		if pickErr != nil {
+			http.Error(w, pickErr.Error(), status)
 			return
 		}
 		// A retry can reuse task_id. Clear prior result/progress before enqueueing,
@@ -522,6 +510,39 @@ func workspaceOwnedBy(nodeWorkspace, ws string) bool {
 	}
 	c := ws[len(nodeWorkspace)]
 	return c == '/' || c == '\\'
+}
+
+// pickDispatchNode is the dispatch endpoint's node decision: which node
+// runs a task, or which rejection the caller gets. Extracted from the
+// handler so every outcome is testable — the workspace match, both 409
+// rejections, the no-workspace fallback and the empty-registry 503.
+//
+// The no-workspace fallback takes the LOWEST online node id. reg.List()
+// ranges a map, so "first online" would be random per call — the same
+// nondeterminism the tie-break in selectNodeForWorkspace exists to avoid.
+func pickDispatchNode(nodes []*heartbeat.Node, ws, executor string) (string, int, error) {
+	if ws != "" {
+		if n := selectNodeForWorkspace(nodes, ws, executor); n != nil {
+			return n.NodeID, 0, nil
+		}
+		// The workspace is known but no owner advertises the executor:
+		// a capability miss, not a routing miss.
+		if len(knownWorkspaceOwners(nodes, ws)) > 0 {
+			return "", http.StatusConflict, fmt.Errorf("executor unavailable on node(s) owning workspace: %s", executor)
+		}
+		return "", http.StatusConflict, fmt.Errorf("no node owns workspace %q (registered: %s)", ws, registeredWorkspaceList(nodes))
+	}
+	var online []string
+	for _, n := range nodes {
+		if n != nil && n.Status != "offline" {
+			online = append(online, n.NodeID)
+		}
+	}
+	if len(online) == 0 {
+		return "", http.StatusServiceUnavailable, errors.New("no nodes available")
+	}
+	sort.Strings(online)
+	return online[0], 0, nil
 }
 
 // selectNodeForWorkspace returns the node that owns ws and supports executor,
