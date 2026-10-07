@@ -752,6 +752,13 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		if bin == "" {
 			return "", false, "executor_unavailable: commandcode (cmd/cmdc)"
 		}
+		// Command Code needs Node >= 22. An old node (an nvm
+		// default, a Volta pin) fails every run in ~140ms and
+		// leaves the card blocked; repoint nvm to an installed
+		// Node >= 22 when one exists, so the run proceeds.
+		if note := ensureNodeForCommandCode(); note != "" {
+			emit("node_preflight", note)
+		}
 		// A requested continuation must actually be honored. Silently starting a
 		// fresh session would re-apply the same feedback to files the previous
 		// turn already edited, so refuse instead of downgrading to a cold run.
@@ -811,6 +818,20 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	emit("process_spawned", "Starting agent process")
 	out, err := streamCommand(cmd, job.TaskID)
 	emit("process_exited", "Agent process finished")
+	// The preflight covers the common stale-node case, but node
+	// can still resolve differently for the launcher than for the
+	// probe. A Node-version failure is fixable: switch node and
+	// rerun once with the same args before any other retry.
+	if executor == "commandcode" && err != nil && nodeVersionTooOldOutput(string(out)) {
+		if note := ensureNodeForCommandCode(); note != "" {
+			emit("node_preflight", note)
+		}
+		retry := commandFor(ctx, resolvedBin, append(resolvedArgs, prompt)...)
+		retry.Dir = ws
+		retry.Env = nodeLauncherEnv()
+		emit("process_spawned", "Retrying Command Code after Node switch")
+		out, err = streamCommand(retry, job.TaskID)
+	}
 	// A build without --output-format json fails on the flag, not on the task.
 	// Retry once in text mode; anything else keeps its original failure.
 	if executor == "commandcode" && err != nil && commandCodeRejectsJSONOutput(out) {
