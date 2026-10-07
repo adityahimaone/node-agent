@@ -21,7 +21,7 @@ case "${1:-}" in
          "$0" scripts
          if [[ -f "$PID" ]] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "already running PID=$(cat "$PID")"; exit 0; fi
          : "${NODE_AGENT_TOKEN:?set NODE_AGENT_TOKEN in $ENV_FILE (openssl rand -hex 32). Pass NODE_AGENT_TOKEN= explicitly to run without auth.}"
-         NODE_AGENT_DIST_DIR="$DIST" nohup env NODE_AGENT_TOKEN="$NODE_AGENT_TOKEN" NODE_AGENT_PUBLIC_URL="${NODE_AGENT_PUBLIC_URL:-}" "$BIN" >>"$LOG" 2>&1 & echo $! > "$PID"; echo "started PID=$(cat "$PID") log=$LOG (auth=$([[ -n "$NODE_AGENT_TOKEN" ]] && echo on || echo OFF))";;
+         NODE_AGENT_DIST_DIR="$DIST" nohup env NODE_AGENT_TOKEN="$NODE_AGENT_TOKEN" NODE_AGENT_PUBLIC_URL="${NODE_AGENT_PUBLIC_URL:-}" NODE_AGENT_GITHUB_RELEASE="${NODE_AGENT_GITHUB_RELEASE:-}" "$BIN" >>"$LOG" 2>&1 & echo $! > "$PID"; echo "started PID=$(cat "$PID") log=$LOG (auth=$([[ -n "$NODE_AGENT_TOKEN" ]] && echo on || echo OFF))";;
   stop)  if [[ -f "$PID" ]]; then kill "$(cat "$PID")" 2>/dev/null || true; rm -f "$PID"; echo "stopped"; else echo "not running"; fi;;
   restart) "$0" stop; sleep 1; "$0" start;;
   status) if [[ -f "$PID" ]] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo "running PID=$(cat "$PID")"; curl -s -H "X-Node-Agent-Token: ${NODE_AGENT_TOKEN:-}" http://127.0.0.1:8788/health | python3 -m json.tool | head -30; else echo "stopped"; fi;;

@@ -27,13 +27,37 @@ $WrapperPath = Join-Path $InstallDir "node-agent-supervisor.ps1"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
+# Fallback download base (e.g. a GitHub release download
+# directory) for when the server is unreachable. The serving
+# node-agent bakes NODE_AGENT_GITHUB_RELEASE in as the
+# default; a NODE_AGENT_RELEASE_URL user variable overrides it.
+$ReleaseBase = if ($env:NODE_AGENT_RELEASE_URL) { $env:NODE_AGENT_RELEASE_URL } else { "__NODE_AGENT_RELEASE_URL__" }
+if ($ReleaseBase -like "__*") { $ReleaseBase = "" }
+
 Write-Host "==> Menarik binary node-agent dari $Server (via tailscale)"
 $headers = @{ "X-Node-Agent-Token" = $Token }
-Invoke-WebRequest -Uri "$Server/dl/windows" -Headers $headers -OutFile "$ExePath.new" -UseBasicParsing
+$Destination = "$ExePath.new"
+$Fetched = $false
+try {
+    Invoke-WebRequest -Uri "$Server/dl/windows" -Headers $headers -OutFile $Destination -UseBasicParsing
+    $Fetched = $true
+} catch {
+    Write-Host "    server unreachable — trying the release URL"
+    if ($ReleaseBase) {
+        try {
+            Invoke-WebRequest -Uri "$($ReleaseBase.TrimEnd('/'))/node-agent-windows-amd64.exe" -OutFile $Destination -UseBasicParsing
+            $Fetched = $true
+        } catch { }
+    }
+}
+if (-not $Fetched) {
+    Write-Error "install failed: neither the server nor the release URL is reachable"
+    exit 1
+}
 # exe lock saat masih jalan — kill dulu, supervisor loop restart pakai binary baru
 Get-Process node-agent -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 1
-Move-Item -Force "$ExePath.new" $ExePath
+Move-Item -Force $Destination $ExePath
 
 Write-Host "==> Menyimpan environment variable (persist antar sesi login)"
 [System.Environment]::SetEnvironmentVariable("NODE_AGENT_SERVER", $Server, "User")

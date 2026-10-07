@@ -17,9 +17,22 @@ LOG_DIR="$HOME/.hermes"
 
 mkdir -p "$INSTALL_DIR" "$LOG_DIR"
 
+# Fallback download base (e.g. a GitHub release download
+# directory) for when the server is unreachable. The serving
+# node-agent bakes NODE_AGENT_GITHUB_RELEASE in as the
+# default; NODE_AGENT_RELEASE_URL overrides it.
+RELEASE_BASE="${NODE_AGENT_RELEASE_URL:-__NODE_AGENT_RELEASE_URL__}"
+if [[ "$RELEASE_BASE" == __* ]]; then RELEASE_BASE=""; fi
+
 echo "==> Menarik binary node-agent dari $NODE_AGENT_SERVER (via tailscale)"
-curl -fsSL -H "X-Node-Agent-Token: $NODE_AGENT_TOKEN" \
-  "$NODE_AGENT_SERVER/dl/mac" -o "$INSTALL_DIR/node-agent.new"
+if ! curl -fsSL -H "X-Node-Agent-Token: $NODE_AGENT_TOKEN" \
+  "$NODE_AGENT_SERVER/dl/mac" -o "$INSTALL_DIR/node-agent.new"; then
+  echo "    server unreachable — trying the release URL" >&2
+  if [[ -z "$RELEASE_BASE" ]] || ! curl -fsSL "${RELEASE_BASE%/}/node-agent-darwin-arm64" -o "$INSTALL_DIR/node-agent.new"; then
+    echo "install failed: neither the server nor the release URL is reachable" >&2
+    exit 1
+  fi
+fi
 chmod +x "$INSTALL_DIR/node-agent.new"
 mv "$INSTALL_DIR/node-agent.new" "$INSTALL_DIR/node-agent"
 

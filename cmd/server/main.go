@@ -508,7 +508,11 @@ func main() {
 	// The stale default server URL inside the installers
 	// is replaced with NODE_AGENT_PUBLIC_URL when it is
 	// set, so a copied command works against this server
-	// without editing anything.
+	// without editing anything. Likewise the release
+	// placeholder is replaced with NODE_AGENT_GITHUB_
+	// RELEASE (a download base such as a GitHub release
+	// directory), giving the scripts a fallback source
+	// when this server is unreachable.
 	serveScript := func(w http.ResponseWriter, fname string) {
 		raw, err := os.ReadFile(filepath.Join(distDir, fname))
 		if err != nil {
@@ -518,6 +522,9 @@ func main() {
 		body := string(raw)
 		if pub := strings.TrimSpace(os.Getenv("NODE_AGENT_PUBLIC_URL")); pub != "" {
 			body = strings.ReplaceAll(body, "http://100.64.0.1:8788", strings.TrimRight(pub, "/"))
+		}
+		if rel := strings.TrimSpace(os.Getenv("NODE_AGENT_GITHUB_RELEASE")); rel != "" {
+			body = strings.ReplaceAll(body, "__NODE_AGENT_RELEASE_URL__", strings.TrimRight(rel, "/"))
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
