@@ -52,7 +52,7 @@ powershell -NoProfile -Command "iex (irm http://<VPS_TAILSCALE_IP>:8788/update/w
 
 The shared token lives in `~/.hermes/node-agent.env` (mode `0600`) on the server and every worker; Switchyard provisions it on first Overview view. Set `NODE_AGENT_PUBLIC_URL` on the server so the served installers default to the right address. What the installers do under the hood: the sections below.
 
-When the server is unreachable (VPN down, VPS offline), the scripts fall back to a release URL — a GitHub release download directory. The server bakes `NODE_AGENT_GITHUB_RELEASE` into the scripts it serves; a worker can override it with `NODE_AGENT_RELEASE_URL`. The value is a download base: the scripts fetch `node-agent-darwin-arm64` / `node-agent-windows-amd64.exe` from it, so publish release assets under those exact names.
+When the server is unreachable (VPN down, VPS offline), the scripts fall back to a release URL — a GitHub release download directory. The server bakes `NODE_AGENT_GITHUB_RELEASE` into the scripts it serves; a worker can override it with `NODE_AGENT_RELEASE_URL`. The value is a download base: the scripts fetch `node-agent-darwin-arm64` / `node-agent-windows-amd64.exe` from it, so publish release assets under those exact names. This repository's releases do (`github.com/adityahimaone/node-agent/releases`), so the fallback is live out of the box.
 
 ## Executors
 
@@ -277,7 +277,7 @@ NODE_AGENT_GRPC_ENABLED=1
 NODE_AGENT_TOKEN=<shared-secret>
 NODE_AGENT_DIST_DIR=./dist
 NODE_AGENT_PUBLIC_URL=http://<VPS_TAILSCALE_IP>:8788
-NODE_AGENT_GITHUB_RELEASE=https://github.com/<owner>/node-agent/releases/latest/download
+NODE_AGENT_GITHUB_RELEASE=https://github.com/adityahimaone/node-agent/releases/latest/download
 ```
 
 `NODE_AGENT_PUBLIC_URL` is the URL the server advertises: the installers it
