@@ -50,9 +50,14 @@ func grpcToken(ctx context.Context) bool {
 	}
 	return false
 }
-func authTokenValue() string { return currentAuthToken }
+// tokenResolver is the gRPC lane's token source, indirect so
+// tests can pin it. Production resolves the same shared secret
+// the HTTP lane does — ~/.hermes/node-agent.env first, then the
+// environment — on every Connect, so a token provisioned or
+// rotated in the file takes effect without a restart.
+var tokenResolver = nodeAgentToken
 
-var currentAuthToken string
+func authTokenValue() string { return tokenResolver() }
 
 type grpcService struct{}
 

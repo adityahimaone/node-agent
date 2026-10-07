@@ -58,12 +58,27 @@ func getQueue(nodeID string) chan transport.DispatchRequest {
 }
 
 // requireToken enforces a shared-secret header on every request when
-// NODE_AGENT_TOKEN is set. Without this, anything that can reach the
+// a token is configured. Without this, anything that can reach the
 // listen address (misconfigured firewall, VPS with a public IP, etc.)
 // can dispatch arbitrary shell commands to every connected node.
-func requireToken(token string) func(http.Handler) http.Handler {
+//
+// The token is resolved per request: ~/.hermes/node-agent.env is the
+// same file the control plane reads and provisions, so a token
+// created or rotated there takes effect without a restart.
+func requireToken() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Secret-free endpoints. The updater reads the
+			// token from the worker's own install and the
+			// installer takes its token from the caller's
+			// environment, so fetching either script needs
+			// no auth — and no token is in hand when curl
+			// fetches them. Binaries stay behind /dl.
+			if strings.HasPrefix(r.URL.Path, "/update/") || strings.HasPrefix(r.URL.Path, "/install/") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			token := httpTokenResolver()
 			if token == "" {
 				next.ServeHTTP(w, r)
 				return
@@ -75,6 +90,32 @@ func requireToken(token string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// httpTokenResolver is the HTTP lane's token source. It is a
+// variable so tests can pin it; production resolves the shared
+// secret on every request.
+var httpTokenResolver = nodeAgentToken
+
+// nodeAgentToken resolves the shared secret for every guarded
+// endpoint. ~/.hermes/node-agent.env wins when present — it is
+// the same file the control plane reads and provisions — and the
+// environment variable is the fallback for installs that predate
+// the file.
+func nodeAgentToken() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		if raw, err := os.ReadFile(filepath.Join(home, ".hermes", "node-agent.env")); err == nil {
+			for _, line := range strings.Split(string(raw), "\n") {
+				line = strings.TrimSpace(line)
+				if v, ok := strings.CutPrefix(line, "NODE_AGENT_TOKEN="); ok {
+					if v = strings.TrimSpace(v); v != "" {
+						return v
+					}
+				}
+			}
+		}
+	}
+	return os.Getenv("NODE_AGENT_TOKEN")
 }
 
 // cleanupResults periodically evicts results older than resultTTL so the
@@ -130,8 +171,9 @@ func main() {
 	if addr == "" {
 		addr = ":8788"
 	}
-	authToken := os.Getenv("NODE_AGENT_TOKEN")
-	if authToken == "" {
+	// Startup health check only: the per-request resolvers below
+	// are what actually authenticate traffic.
+	if nodeAgentToken() == "" {
 		log.Printf("WARNING: NODE_AGENT_TOKEN is not set — /api endpoints are UNAUTHENTICATED. " +
 			"Set NODE_AGENT_TOKEN (and the same value on every agent) before exposing this beyond localhost.")
 	}
@@ -139,7 +181,6 @@ func main() {
 	if distDir == "" {
 		distDir = "./dist"
 	}
-	currentAuthToken = authToken
 
 	// gRPC listener (worker lane). Disabled by setting NODE_AGENT_GRPC_ENABLED=0.
 	grpcAddr := os.Getenv("NODE_AGENT_GRPC_ADDR")
@@ -176,7 +217,7 @@ func main() {
 	}
 
 	r := chi.NewRouter()
-	r.Use(requireToken(authToken))
+	r.Use(requireToken())
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		transport.WriteJSON(w, 200, map[string]any{"ok": true, "nodes": reg.List()})
@@ -456,7 +497,58 @@ func main() {
 		http.ServeFile(w, r, path)
 	})
 
-	log.Printf("node-agent server listening on %s (auth=%v)", addr, authToken != "")
+	// One-command updaters and installers, served plain:
+	// they are secret-free. The updater reads the token
+	// from the worker's own install (LaunchAgent plist on
+	// mac, User environment on windows) and fetches the
+	// binary through the token-guarded /dl endpoint, so an
+	// update never re-asks for the token; the installer
+	// takes its token from the caller's environment.
+	//
+	// The stale default server URL inside the installers
+	// is replaced with NODE_AGENT_PUBLIC_URL when it is
+	// set, so a copied command works against this server
+	// without editing anything.
+	serveScript := func(w http.ResponseWriter, fname string) {
+		raw, err := os.ReadFile(filepath.Join(distDir, fname))
+		if err != nil {
+			http.Error(w, "script not built yet — run ./ctl.sh scripts on the VPS", http.StatusNotFound)
+			return
+		}
+		body := string(raw)
+		if pub := strings.TrimSpace(os.Getenv("NODE_AGENT_PUBLIC_URL")); pub != "" {
+			body = strings.ReplaceAll(body, "http://100.64.0.1:8788", strings.TrimRight(pub, "/"))
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(body))
+	}
+	allowedUpdaters := map[string]string{
+		"mac":     "update-mac.sh",
+		"windows": "update-windows.ps1",
+	}
+	r.Get("/update/{platform}", func(w http.ResponseWriter, r *http.Request) {
+		fname, ok := allowedUpdaters[chi.URLParam(r, "platform")]
+		if !ok {
+			http.Error(w, "unknown platform", http.StatusNotFound)
+			return
+		}
+		serveScript(w, fname)
+	})
+	allowedInstallers := map[string]string{
+		"mac":     "install-mac.sh",
+		"windows": "install-windows.ps1",
+	}
+	r.Get("/install/{platform}", func(w http.ResponseWriter, r *http.Request) {
+		fname, ok := allowedInstallers[chi.URLParam(r, "platform")]
+		if !ok {
+			http.Error(w, "unknown platform", http.StatusNotFound)
+			return
+		}
+		serveScript(w, fname)
+	})
+
+	log.Printf("node-agent server listening on %s (auth=%v)", addr, nodeAgentToken() != "")
 	if err := http.ListenAndServe(addr, r); err != nil {
 		log.Fatal(err)
 	}
