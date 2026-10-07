@@ -136,7 +136,7 @@ The server accepts an explicit executor only when it is advertised by the select
 
 ## Dispatch API
 
-All `/api/*` and `/dl/*` endpoints use `X-Node-Agent-Token` when token authentication is configured on both server and agent.
+All `/api/*` and `/dl/*` endpoints use `X-Node-Agent-Token` when token authentication is configured on both server and agent. The `/update/*` and `/install/*` script endpoints are the exception — they are secret-free: the updater reads the token from the worker's own install, and the installer takes its token from the caller's environment.
 
 ### Send an AI job
 
@@ -218,6 +218,10 @@ Result fields include `success`, `output`, `error`, and `duration_ms`. Dispatch 
 | GET | `/api/workspaces` | Server workspaces and node status |
 | GET | `/dl/mac` | Download the Mac binary |
 | GET | `/dl/windows` | Download the Windows binary |
+| GET | `/update/mac` | One-command Mac updater script (secret-free) |
+| GET | `/update/windows` | One-command Windows updater script (secret-free) |
+| GET | `/install/mac` | Mac installer script (secret-free) |
+| GET | `/install/windows` | Windows installer script (secret-free) |
 
 ## Context and output optimization
 
@@ -254,7 +258,15 @@ NODE_AGENT_GRPC_ADDR=:8789
 NODE_AGENT_GRPC_ENABLED=1
 NODE_AGENT_TOKEN=<shared-secret>
 NODE_AGENT_DIST_DIR=./dist
+NODE_AGENT_PUBLIC_URL=http://<VPS_TAILSCALE_IP>:8788
 ```
+
+`NODE_AGENT_PUBLIC_URL` is the URL the server advertises: the installers it
+serves have it baked in as their default server, so a copied command works
+without editing. The token itself resolves per request — `~/.hermes/
+node-agent.env` first (the same file Switchyard reads and provisions), the
+`NODE_AGENT_TOKEN` environment variable second — so a token created or rotated
+in the file takes effect without a server restart.
 
 Agent transport:
 
@@ -291,7 +303,7 @@ NODE_AGENT_DSH_CONFLICT_DELAY_MS=1000
 Leave `NODE_AGENT_DSH_HOME` unset to keep the default isolated home. Do not
 point it at `~/.dsh` — that restores the lock contention with `dsh web`.
 
-The token must match on the server and every agent. Store it in `~/.hermes/node-agent.env` with file mode `0600`.
+The token must match on the server and every agent. Store it in `~/.hermes/node-agent.env` with file mode `0600`. Both the server and Switchyard resolve that file directly, so it is the single source of truth — no shell exports, and rotation needs no restart.
 
 ## Install the server on the VPS
 
@@ -302,7 +314,9 @@ NODE_AGENT_TOKEN=<token> ./ctl.sh start
 curl -H "X-Node-Agent-Token: <token>" http://<VPS_TAILSCALE_IP>:8788/health
 ```
 
-`ctl.sh` also cross-builds worker binaries and serves them through `/dl/mac` and `/dl/windows`.
+`ctl.sh` also copies the operator scripts (installers and updaters) into `dist/`
+on every start and cross-builds worker binaries; both are served through the
+HTTP endpoints above.
 
 ## Install the Mac agent
 
@@ -314,6 +328,14 @@ NODE_AGENT_TOKEN=<same-token-as-VPS> ./scripts/install-mac.sh
 
 The installer downloads the binary, writes a KeepAlive LaunchAgent, and verifies registration.
 
+One-command variant (no token to type — the token and server URL are read from
+the existing LaunchAgent config, so it also upgrades an installed agent):
+
+```sh
+curl -fsSL http://<VPS_TAILSCALE_IP>:8788/install/mac | env NODE_AGENT_TOKEN=<token> bash   # first install
+curl -fsSL http://<VPS_TAILSCALE_IP>:8788/update/mac | bash                                 # upgrade, no token
+```
+
 ## Install the Windows agent
 
 ```powershell
@@ -323,6 +345,15 @@ $env:NODE_AGENT_TOKEN = "<same-token-as-VPS>"
 ```
 
 The installer uses a Scheduled Task at logon and a supervisor to restart the binary when it exits. The Windows CommandCode alias is `cmdc`; `cmd` is the built-in command shell.
+
+One-command variants (the updater reads the token and server URL from the
+persisted User environment variables, so an upgrade never re-asks for the
+token):
+
+```powershell
+powershell -NoProfile -Command "$env:NODE_AGENT_TOKEN='<token>'; iex (irm http://<VPS_TAILSCALE_IP>:8788/install/windows)"   # first install
+powershell -NoProfile -Command "iex (irm http://<VPS_TAILSCALE_IP>:8788/update/windows)"                                    # upgrade, no token
+```
 
 ## Workspace routing
 
