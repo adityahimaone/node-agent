@@ -29,7 +29,12 @@ var (
 	qmu      sync.Mutex
 	results  = map[string]storedResult{}
 	progress = map[string]string{}
-	rmu      sync.Mutex
+	// progressBase[id] is the absolute offset of progress[id]'s
+	// first byte: the buffer is capped by dropping its oldest
+	// bytes, so the base tracks what was dropped and lets a
+	// poller's offset stay absolute across a truncation.
+	progressBase = map[string]int{}
+	rmu          sync.Mutex
 )
 
 // storedResult wraps a ResultRequest with the time it was stored, so stale
@@ -252,7 +257,9 @@ func main() {
 		progress[req.TaskID] += req.Chunk
 		// cap at 512KB to avoid unbounded growth
 		if len(progress[req.TaskID]) > 512*1024 {
-			progress[req.TaskID] = progress[req.TaskID][len(progress[req.TaskID])-512*1024:]
+			dropped := len(progress[req.TaskID]) - 512*1024
+			progressBase[req.TaskID] += dropped
+			progress[req.TaskID] = progress[req.TaskID][dropped:]
 		}
 		rmu.Unlock()
 		transport.WriteJSON(w, 200, map[string]string{"status": "ok"})
@@ -268,20 +275,12 @@ func main() {
 		}
 		rmu.Lock()
 		full := progress[id]
+		base := progressBase[id]
 		sr, hasResult := results[id]
 		rmu.Unlock()
-		text := ""
-		if off < len(full) {
-			text = full[off:]
-		} else if off > len(full) {
-			text = full
-			off = 0
-		}
+		text, next := progressWindow(full, base, off)
 		done := hasResult
-		if hasResult && off >= len(full) {
-			// still need to signal done so poller stops
-		}
-		transport.WriteJSON(w, 200, map[string]any{"task_id": id, "text": text, "offset": off + len(text), "done": done, "has_result": hasResult, "result": sr.res})
+		transport.WriteJSON(w, 200, map[string]any{"task_id": id, "text": text, "offset": next, "done": done, "has_result": hasResult, "result": sr.res})
 	})
 	r.Post("/api/dispatch", func(w http.ResponseWriter, r *http.Request) {
 		var req transport.DispatchRequest

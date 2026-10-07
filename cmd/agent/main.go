@@ -189,7 +189,7 @@ func main() {
 		emitter.Close()
 
 		res := dshResult(job, output, ok, errStr, dur)
-		if err := postJSON(server+"/api/nodes/"+nodeID+"/result", res); err != nil {
+		if err := postResult(server+"/api/nodes/"+nodeID+"/result", res); err != nil {
 			log.Printf("result post err: %v", err)
 		}
 		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: "idle"})
@@ -416,6 +416,30 @@ func postJSON(url string, v any) error {
 	}
 	return nil
 }
+
+// resultPostBackoff is the pause between result-delivery
+// attempts. A variable so tests do not wait out the production
+// delay.
+var resultPostBackoff = 2 * time.Second
+
+// postResult delivers a job's result with retries. The result
+// post is the one call whose loss costs a full re-run — the
+// control plane waits out the job timeout before trying again —
+// so a tailnet blip must not drop it.
+func postResult(url string, v any) error {
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err = postJSON(url, v); err == nil {
+			return nil
+		}
+		log.Printf("result post err (attempt %d/3): %v", attempt, err)
+		if attempt < 3 {
+			time.Sleep(resultPostBackoff)
+		}
+	}
+	return err
+}
+
 func readAll(r *http.Response) []byte { defer r.Body.Close(); b, _ := bytesReadAll(r); return b }
 func bytesReadAll(r *http.Response) ([]byte, error) {
 	buf := new(bytes.Buffer)

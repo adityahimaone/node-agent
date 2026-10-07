@@ -834,3 +834,53 @@ func TestApplyEditCRLFFileMatchesLFOldStr(t *testing.T) {
 		t.Fatalf("wrong CRLF result: %q", raw)
 	}
 }
+
+// TestPostResultRetriesABlippedDelivery: the result post
+// is the one call whose loss costs a full re-run, so a
+// server error must be retried, not dropped.
+func TestPostResultRetriesABlippedDelivery(t *testing.T) {
+	origBackoff := resultPostBackoff
+	resultPostBackoff = time.Millisecond
+	t.Cleanup(func() { resultPostBackoff = origBackoff })
+
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			http.Error(w, "blip", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := postResult(srv.URL, transport.ResultRequest{TaskID: "t1"}); err != nil {
+		t.Fatalf("postResult: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+// TestPostResultGivesUpAfterThreeAttempts: retries are
+// bounded — a node-agent that is down must not block the
+// single poll loop forever.
+func TestPostResultGivesUpAfterThreeAttempts(t *testing.T) {
+	origBackoff := resultPostBackoff
+	resultPostBackoff = time.Millisecond
+	t.Cleanup(func() { resultPostBackoff = origBackoff })
+
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	if err := postResult(srv.URL, transport.ResultRequest{TaskID: "t1"}); err == nil {
+		t.Fatal("expected postResult to fail after three attempts")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
