@@ -36,6 +36,22 @@ sequenceDiagram
 
 The server keeps the queue and results in memory. An agent registers, sends heartbeats, receives one job, executes it, and posts the result back. Switchyard remains responsible for board state, retries, review, commit, and push.
 
+## One-command install & update
+
+Updating an agent never asks for the token again — the updater reads the token and server URL from the worker's own install (LaunchAgent config on Mac, User environment on Windows). First install is one command too, and it is the only time the token is typed:
+
+```sh
+# first install
+curl -fsSL http://<VPS_TAILSCALE_IP>:8788/install/mac | env NODE_AGENT_TOKEN=<token> bash
+powershell -NoProfile -Command "$env:NODE_AGENT_TOKEN='<token>'; iex (irm http://<VPS_TAILSCALE_IP>:8788/install/windows)"
+
+# upgrade — no token
+curl -fsSL http://<VPS_TAILSCALE_IP>:8788/update/mac | bash
+powershell -NoProfile -Command "iex (irm http://<VPS_TAILSCALE_IP>:8788/update/windows)"
+```
+
+The shared token lives in `~/.hermes/node-agent.env` (mode `0600`) on the server and every worker; Switchyard provisions it on first Overview view. Set `NODE_AGENT_PUBLIC_URL` on the server so the served installers default to the right address. What the installers do under the hood: the sections below.
+
 ## Executors
 
 | Executor | Binary | Mode | Notes |
@@ -326,15 +342,7 @@ VPS server upgrades do not replace the agent binary running on Mac. Install the 
 NODE_AGENT_TOKEN=<same-token-as-VPS> ./scripts/install-mac.sh
 ```
 
-The installer downloads the binary, writes a KeepAlive LaunchAgent, and verifies registration.
-
-One-command variant (no token to type — the token and server URL are read from
-the existing LaunchAgent config, so it also upgrades an installed agent):
-
-```sh
-curl -fsSL http://<VPS_TAILSCALE_IP>:8788/install/mac | env NODE_AGENT_TOKEN=<token> bash   # first install
-curl -fsSL http://<VPS_TAILSCALE_IP>:8788/update/mac | bash                                 # upgrade, no token
-```
+The installer downloads the binary, writes a KeepAlive LaunchAgent, and verifies registration. The one-command install and upgrade variants are above.
 
 ## Install the Windows agent
 
@@ -344,16 +352,7 @@ $env:NODE_AGENT_TOKEN = "<same-token-as-VPS>"
 .\scripts\install-windows.ps1
 ```
 
-The installer uses a Scheduled Task at logon and a supervisor to restart the binary when it exits. The Windows CommandCode alias is `cmdc`; `cmd` is the built-in command shell.
-
-One-command variants (the updater reads the token and server URL from the
-persisted User environment variables, so an upgrade never re-asks for the
-token):
-
-```powershell
-powershell -NoProfile -Command "$env:NODE_AGENT_TOKEN='<token>'; iex (irm http://<VPS_TAILSCALE_IP>:8788/install/windows)"   # first install
-powershell -NoProfile -Command "iex (irm http://<VPS_TAILSCALE_IP>:8788/update/windows)"                                    # upgrade, no token
-```
+The installer uses a Scheduled Task at logon and a supervisor to restart the binary when it exits. The Windows CommandCode alias is `cmdc`; `cmd` is the built-in command shell. The one-command install and upgrade variants are above.
 
 ## Workspace routing
 
