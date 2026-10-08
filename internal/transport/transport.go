@@ -54,7 +54,9 @@ type DispatchRequest struct {
 	// CommandCodeSessionID resumes the same Command Code session for task comments.
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
 	// OMPSessionID resumes the same omp session for task comments.
-	OMPSessionID        string `json:"omp_session_id,omitempty"`
+	OMPSessionID string `json:"omp_session_id,omitempty"`
+	// ClaudeSessionID resumes the same Claude Code CLI session for task comments.
+	ClaudeSessionID     string `json:"claude_session_id,omitempty"`
 	LastTurnSeq         *int64 `json:"last_turn_seq,omitempty"`
 	LastCommentID       *int64 `json:"last_comment_id,omitempty"`
 	RunID               string `json:"run_id,omitempty"`
@@ -95,7 +97,9 @@ type ResultRequest struct {
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
 	// OMPSessionID is the omp session this run belongs to.
 	OMPSessionID string `json:"omp_session_id,omitempty"`
-	LastTurnSeq  *int64 `json:"last_turn_seq,omitempty"`
+	// ClaudeSessionID is the Claude Code CLI session this run belongs to.
+	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	LastTurnSeq     *int64 `json:"last_turn_seq,omitempty"`
 	// Artifacts are files the run produced, already stored on this node. Only
 	// the metadata rides along here; the control plane pulls the bytes over the
 	// artifact endpoint. See cmd/server/artifacts.go.

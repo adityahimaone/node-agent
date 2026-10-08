@@ -277,7 +277,7 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
@@ -286,8 +286,8 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 		atomic.StoreInt32(&busy, 0)
 		// Executor and the harness session fields must survive into the result or a
 		// continuation cannot prove which session it belongs to.
-		res := dshResult(transport.DispatchRequest{TaskID: job.TaskID, Executor: job.Executor, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, LastTurnSeq: job.LastTurnSeq}, output, ok, errStr, dur)
-		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: res.TaskID, Success: res.Success, Output: res.Output, Error: res.Error, DurationMs: res.DurationMs, DSHSessionID: res.DSHSessionID, DSHWorkspaceID: res.DSHWorkspaceID, CommandCodeSessionID: res.CommandCodeSessionID, OMPSessionID: res.OMPSessionID, LastTurnSeq: res.LastTurnSeq}}); err != nil {
+		res := dshResult(transport.DispatchRequest{TaskID: job.TaskID, Executor: job.Executor, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID, LastTurnSeq: job.LastTurnSeq}, output, ok, errStr, dur)
+		if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DeliveryID, TaskID: res.TaskID, Success: res.Success, Output: res.Output, Error: res.Error, DurationMs: res.DurationMs, DSHSessionID: res.DSHSessionID, DSHWorkspaceID: res.DSHWorkspaceID, CommandCodeSessionID: res.CommandCodeSessionID, OMPSessionID: res.OMPSessionID, ClaudeSessionID: res.ClaudeSessionID, LastTurnSeq: res.LastTurnSeq}}); err != nil {
 			return err
 		}
 		_ = stream.Send(&transport.WorkerFrame{Heartbeat: &transport.HeartbeatFrame{NodeID: nodeID, Status: "idle"}})
@@ -777,6 +777,17 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 		// The launcher is a node script on macOS; give it a PATH that has node.
 		cmd.Env = nodeLauncherEnv()
+	case "claude":
+		if job.SessionContinuation && strings.TrimSpace(job.ClaudeSessionID) == "" {
+			return "", false, "claude_session_missing: continuation requested but no session id was dispatched (worker/control-plane version mismatch?)"
+		}
+		bin := claudeBin()
+		if bin == "" {
+			return "", false, "executor_unavailable: claude (Claude Code CLI not installed or not on PATH)"
+		}
+		resolvedBin = bin
+		resolvedArgs = claudeArgs(job)
+		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 	case "omp":
 		bin := ompBin()
 		if bin == "" {
@@ -874,6 +885,13 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 			ompSessionID = strings.TrimSpace(job.OMPSessionID)
 		}
 	}
+	claudeSessionID := ""
+	if executor == "claude" {
+		claudeSessionID = parseClaudeResult(out).SessionID
+		if claudeSessionID == "" {
+			claudeSessionID = strings.TrimSpace(job.ClaudeSessionID)
+		}
+	}
 	if executor == "dsh" && sessionID != "" && os.Getenv("NODE_AGENT_DSH_WORKSPACE_REGISTRATION") != "0" {
 		if registrationErr := registerDeepSeekHarnessWorkspace(ws, sessionID); registrationErr != nil {
 			return string(out), false, "dsh_workspace_registration_failed: " + registrationErr.Error()
@@ -905,6 +923,9 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	if ompSessionID != "" {
 		provenance += fmt.Sprintf(" omp_session_id=%s", ompSessionID)
 	}
+	if claudeSessionID != "" {
+		provenance += fmt.Sprintf(" claude_session_id=%s", claudeSessionID)
+	}
 	// A successful JSON run must prove identity so the control plane can bind it.
 	// A text-mode fallback legitimately cannot, and is treated as a first run.
 	if executor == "commandcode" && commandCodeSessionID == "" && err == nil && commandCodeJSONOutputRequested(resolvedArgs) {
@@ -914,6 +935,9 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	// run never proved identity and the card must not be bound to a guessed id.
 	if executor == "omp" && ompSessionID == "" && err == nil {
 		return string(out), false, "omp_session_missing: headless --mode json returned no session id"
+	}
+	if executor == "claude" && claudeSessionID == "" && err == nil {
+		return string(out), false, "claude_session_missing: headless --output-format json returned no session_id"
 	}
 	if executor == "dsh" && sessionID == "" && err == nil {
 		return string(out), false, "dsh_session_missing: headless --json returned no session event"
@@ -945,11 +969,17 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 }
 
 func dshResult(job transport.DispatchRequest, output string, ok bool, errStr string, durationMs int64) transport.ResultRequest {
-	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID}
+	result := transport.ResultRequest{TaskID: job.TaskID, Success: ok, Output: output, Error: errStr, DurationMs: durationMs, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, LastTurnSeq: job.LastTurnSeq, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID}
 	// Upload anything the run left in its artifact dir, so the control plane can
 	// attach it to the card. Best-effort: a missing screenshot must not turn a
 	// passing run into a failed one, so a failure here is logged, not fatal.
 	result.Artifacts = uploadJobArtifacts(job)
+	if job.Executor == "claude" {
+		if sessionID := parseClaudeResult([]byte(output)).SessionID; sessionID != "" {
+			result.ClaudeSessionID = sessionID
+		}
+		return result
+	}
 	if job.Executor == "omp" {
 		// omp emits no turn counter, so LastTurnSeq stays nil and the control
 		// plane falls back to its run-ownership fence.
@@ -1478,6 +1508,10 @@ func ompBin() string {
 	return findBin("omp")
 }
 
+func claudeBin() string {
+	return findBin("claude")
+}
+
 // npmShimEntry is a Windows npm launcher resolved past its `.cmd` shim.
 type npmShimEntry struct {
 	// Entry is the JavaScript module to run, e.g. .../dist/index.mjs.
@@ -1596,6 +1630,7 @@ func detectExecutors() ([]string, map[string]string) {
 		{"dsh", []string{"dsh"}},
 		{"commandcode", commandCodeBinNames()},
 		{"omp", []string{"omp"}},
+		{"claude", []string{"claude"}},
 	}
 	var out []string
 	versions := map[string]string{}
@@ -2502,6 +2537,38 @@ func ompArgs(job transport.DispatchRequest) []string {
 		args = append(args, "--resume", sessionID)
 	}
 	return args
+}
+
+func claudeArgs(job transport.DispatchRequest) []string {
+	args := []string{"-p", "--output-format", "json", "--permission-mode", "bypassPermissions"}
+	if sessionID := strings.TrimSpace(job.ClaudeSessionID); sessionID != "" {
+		args = append(args, "--resume", sessionID)
+	}
+	return args
+}
+
+type claudeResult struct {
+	Type      string `json:"type"`
+	Subtype   string `json:"subtype"`
+	SessionID string `json:"session_id"`
+	Result    string `json:"result"`
+	IsError   bool   `json:"is_error"`
+}
+
+func parseClaudeResult(raw []byte) claudeResult {
+	var result claudeResult
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var candidate claudeResult
+		if json.Unmarshal([]byte(line), &candidate) != nil || candidate.Type != "result" {
+			continue
+		}
+		result = candidate
+	}
+	return result
 }
 
 // ompSessionFrame matches the session identity that any `omp --mode json` frame

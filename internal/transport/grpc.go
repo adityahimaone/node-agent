@@ -48,6 +48,7 @@ type JobResult struct {
 	// Without them a continuation would arrive with no session to resume.
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
 	OMPSessionID         string `json:"omp_session_id,omitempty"`
+	ClaudeSessionID      string `json:"claude_session_id,omitempty"`
 	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
 	// Artifacts mirrors ResultRequest.Artifacts so the gRPC lane carries the
 	// same evidence as the HTTP lane — otherwise which transport a node
@@ -86,6 +87,7 @@ type DispatchJob struct {
 	HarnessKind          string `json:"harness_kind,omitempty"`
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
 	OMPSessionID         string `json:"omp_session_id,omitempty"`
+	ClaudeSessionID      string `json:"claude_session_id,omitempty"`
 	LastTurnSeq          *int64 `json:"last_turn_seq,omitempty"`
 	LastCommentID        *int64 `json:"last_comment_id,omitempty"`
 	RunID                string `json:"run_id,omitempty"`

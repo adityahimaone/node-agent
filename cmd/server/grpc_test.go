@@ -54,7 +54,7 @@ func TestGRPCConnectLifecycle(t *testing.T) {
 	if len(n.Transports) == 0 || n.Transports[0] != "grpc" {
 		t.Fatalf("node transports = %v", n.Transports)
 	}
-	if id, ok := dispatchGRPC(transport.DispatchRequest{TaskID: "t1", Board: "b", Workspace: "/ws", Message: "m"}, "test-node"); !ok || id == "" {
+	if id, ok := dispatchGRPC(transport.DispatchRequest{TaskID: "t1", Board: "b", Workspace: "/ws", Message: "m", Executor: "claude", ClaudeSessionID: "session-from-switchyard"}, "test-node"); !ok || id == "" {
 		t.Fatalf("dispatchGRPC failed ok=%v id=%q", ok, id)
 	}
 	job, err := stream.Recv()
@@ -64,10 +64,13 @@ func TestGRPCConnectLifecycle(t *testing.T) {
 	if job.DispatchJob.TaskID != "t1" {
 		t.Fatalf("job task_id = %q", job.DispatchJob.TaskID)
 	}
+	if job.DispatchJob.ClaudeSessionID != "session-from-switchyard" {
+		t.Fatalf("dispatch claude session = %q", job.DispatchJob.ClaudeSessionID)
+	}
 	if err := stream.Send(&transport.WorkerFrame{JobAck: &transport.JobAck{DeliveryID: job.DispatchJob.DeliveryID, Accepted: true}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DispatchJob.DeliveryID, TaskID: "t1", Success: true, Output: "done"}}); err != nil {
+	if err := stream.Send(&transport.WorkerFrame{JobResult: &transport.JobResult{DeliveryID: job.DispatchJob.DeliveryID, TaskID: "t1", Success: true, Output: "done", ClaudeSessionID: "session-from-worker"}}); err != nil {
 		t.Fatal(err)
 	}
 	frame, err := stream.Recv()
@@ -82,5 +85,8 @@ func TestGRPCConnectLifecycle(t *testing.T) {
 	rmu.Unlock()
 	if !ok || !sr.res.Success {
 		t.Fatalf("results map missing t1: %+v", sr)
+	}
+	if sr.res.ClaudeSessionID != "session-from-worker" {
+		t.Fatalf("result claude session = %q", sr.res.ClaudeSessionID)
 	}
 }

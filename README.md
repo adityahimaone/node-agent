@@ -62,6 +62,7 @@ When the server is unreachable (VPN down, VPS offline), the scripts fall back to
 | `codex` | `codex` | `codex exec --full-auto` | Non-interactive coding tasks |
 | `dsh` | `dsh` | `--profile headless --json` | DeepSeek Harness session; isolated `DSH_HOME` |
 | `commandcode` | `cmd`, `cmdc`, or `command-code` | `-p ... --yolo` | `cmdc` is the Windows alias |
+| `claude` | `claude` | `-p --output-format json --permission-mode bypassPermissions` | Claude Code; per-card session continuity via `--resume`; trusted nodes only |
 | `omp` | `omp` | `-p --auto-approve --mode json` | oh-my-pi; session continuity via `--resume` |
 | `shell` | OS shell | `bash -lc` or `cmd /c` | `command` only; `body` is description — empty `command` rejected |
 | `auto` | Available capability | Hermes, then Codex, then CommandCode, then omp | Compatibility mode |
@@ -108,6 +109,22 @@ executor.
 Full contract, install steps, and troubleshooting:
 [docs/omp-harness.md](docs/omp-harness.md).
 
+### Claude Code CLI
+
+Claude Code is an explicit worker executor, not part of the `auto` fallback.
+Install it using Anthropic's [platform-native CLI instructions](https://code.claude.com/docs/en/overview), then authenticate as the same OS account that runs node-agent. The node-agent installers deploy only the worker; they do not install Claude Code or provision Anthropic credentials.
+
+The worker runs a terminal prompt without an interactive UI and requests JSON result metadata:
+
+```sh
+claude -p --output-format json --permission-mode bypassPermissions "<prompt>"
+claude -p --output-format json --permission-mode bypassPermissions --resume <session-id> "<prompt>"
+```
+
+`bypassPermissions` allows unattended file edits and shell commands. Use this only on registered, trusted worker hosts. The first run omits `--resume`; its terminal result must return `session_id`. A successful result without that ID fails closed with `claude_session_missing:`. Continuations must resume the dispatched ID and may not fall back to a cold session. Claude emits no turn cursor or workspace identity, so Switchyard's `current_run_id` fence protects against stale results.
+
+Restart node-agent after installing/authenticating Claude Code, then verify `/api/nodes` lists `claude` and `versions.claude`. See the [Claude Code worker contract](docs/claude-code-harness.md) and [Switchyard continuity contract](https://github.com/adityahimaone/switchyard/blob/main/docs/features/claude-code-executor.md).
+
 ### DeepSeek Harness
 
 `dsh` runs the DeepSeek Harness headless profile on the workspace host:
@@ -145,8 +162,8 @@ At startup the agent finds available binaries and sends capabilities:
   "hostname": "worker-mac",
   "version": "0.3.0",
   "workspaces": ["/Users/<user>/Development"],
-  "executors": ["hermes", "codex", "dsh", "commandcode", "omp", "shell"],
-  "versions": {"commandcode": "...", "omp": "omp/18.4.0", "tailscale": "1.102.2 (Running)"}
+  "executors": ["hermes", "codex", "dsh", "commandcode", "claude", "omp", "shell"],
+  "versions": {"commandcode": "...", "claude": "...", "omp": "omp/18.4.0", "tailscale": "1.102.2 (Running)"}
 }
 ```
 
