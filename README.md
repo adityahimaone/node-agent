@@ -146,11 +146,13 @@ At startup the agent finds available binaries and sends capabilities:
   "version": "0.3.0",
   "workspaces": ["/Users/<user>/Development"],
   "executors": ["hermes", "codex", "dsh", "commandcode", "omp", "shell"],
-  "versions": {"commandcode": "...", "omp": "omp/18.4.0"}
+  "versions": {"commandcode": "...", "omp": "omp/18.4.0", "tailscale": "1.102.2 (Running)"}
 }
 ```
 
 The server accepts an explicit executor only when it is advertised by the selected node. If multiple nodes provide the same workspace, executor capability is also used for selection.
+
+`versions` is what the Switchyard Overview's Integration health card reads. Each entry is the binary's `--version` output; `tailscale` is probed through `tailscale status --json`, so its value carries the tailnet state — only `(Running)` reads as connected. A binary that exists but fails its probe reports `probe failed`.
 
 ## Dispatch API
 

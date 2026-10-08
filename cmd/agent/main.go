@@ -623,11 +623,11 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		cgStatus := ensureCodegraph(ws)
 		emit("codegraph_preflight", "Checking workspace structure")
 		prequest := ""
-		if strings.TrimSpace(job.DSHSessionID) == "" {
+		if !job.SessionContinuation {
 			prequest = readPrequest(ws, job.PrequestNote)
 		}
 		if executor != "shell" && (prequest != "" || cgStatus != "") {
-			prompt = prequest + "\n\n[" + cgStatus + "]\n\nTask:\n" + job.Message
+			prompt = projectContextPrompt(job.Message, prequest, cgStatus, job.SessionContinuation)
 		}
 		if useShellPreflight {
 			// Shell receives context through environment, never by mutating command text.
@@ -1611,13 +1611,79 @@ func detectExecutors() ([]string, map[string]string) {
 				// Same node-on-PATH requirement as the run itself.
 				cmd.Env = nodeLauncherEnv()
 			}
-			b, _ := cmd.CombinedOutput()
+			b, err := cmd.CombinedOutput()
 			cancel()
-			versions[c.name] = strings.TrimSpace(string(b))
+			if err != nil {
+				versions[c.name] = "probe failed"
+			} else {
+				versions[c.name] = strings.TrimSpace(string(b))
+			}
 		}
 	}
+	// codegraph is workspace preflight context, not a dispatchable executor.
+	probes := []struct {
+		name string
+		bins []string
+	}{
+		{"codegraph", []string{"codegraph"}},
+		{"pen-dev", []string{"pen"}},
+		{"e2e", []string{"playwright"}},
+		{"git", []string{"git"}},
+	}
+	for _, probe := range probes {
+		if bin := findBinAny(probe.bins...); bin != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			cmd := commandFor(ctx, bin, "--version")
+			b, err := cmd.CombinedOutput()
+			cancel()
+			if err != nil {
+				versions[probe.name] = "probe failed"
+			} else {
+				versions[probe.name] = strings.TrimSpace(string(b))
+			}
+		}
+	}
+	if versions["dsh"] != "" {
+		versions["deepseek"] = versions["dsh"]
+	}
+	// tailscale is the fleet's fabric rather than a dispatchable
+	// tool, so it probes the daemon's status JSON: one response
+	// carries both the release and the tailnet state the Overview
+	// reads as connection health, and a daemon that is down fails
+	// the probe outright.
+	if bin := findBinAny("tailscale"); bin != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cmd := commandFor(ctx, bin, "status", "--json")
+		b, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			versions["tailscale"] = "probe failed"
+		} else {
+			versions["tailscale"] = tailscaleVersion(b)
+		}
+	}
+	versions["node-agent"] = "0.3.0"
 	out = append(out, "shell")
 	return out, versions
+}
+
+// tailscaleVersion renders the status JSON for the Integration
+// health view: the release plus the tailnet state, so a node
+// whose daemon is up but off the tailnet reads as unhealthy.
+func tailscaleVersion(jsonBody []byte) string {
+	var ts struct {
+		Version      string `json:"Version"`
+		BackendState string `json:"BackendState"`
+	}
+	if json.Unmarshal(jsonBody, &ts) != nil || ts.Version == "" {
+		return "probe failed"
+	}
+	release, _, _ := strings.Cut(ts.Version, "-")
+	state := ts.BackendState
+	if state == "" {
+		state = "unknown"
+	}
+	return release + " (" + state + ")"
 }
 
 // ensureCodegraph makes sure the workspace has a codegraph index. Non-fatal:
@@ -1645,6 +1711,16 @@ func ensureCodegraph(ws string) string {
 		return fmt.Sprintf("codegraph init failed (continuing): %v", err)
 	}
 	return "codegraph init: ok"
+}
+
+func projectContextPrompt(message, prequest, codegraphStatus string, continuation bool) string {
+	if continuation {
+		return message
+	}
+	if prequest == "" && codegraphStatus == "" {
+		return message
+	}
+	return prequest + "\n\n[" + codegraphStatus + "]\n\nTask:\n" + message
 }
 
 // readPrequest returns the project prerequisites text: the server-injected

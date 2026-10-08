@@ -44,7 +44,7 @@ type DispatchRequest struct {
 	MaxIterations int    `json:"max_iterations,omitempty"`
 	Acceptance    string `json:"acceptance,omitempty"`
 	// PrequestNote is the workspace prequest (project prerequisites) injected
-	// by the server from workspaces.json Note — prepended to the agent prompt.
+	// by the server from workspaces.json Note on first runs, not continuations.
 	PrequestNote string `json:"prequest_note,omitempty"`
 	// DSHSessionID resumes same DeepSeek Harness session for task comments.
 	DSHSessionID   string `json:"dsh_session_id,omitempty"`

@@ -627,6 +627,23 @@ func TestRunJobShellPreflightUsesEnvironment(t *testing.T) {
 	}
 }
 
+func TestProjectContextPromptPreservesReviewContinuation(t *testing.T) {
+	message := "[Switchyard review comment — task t_852c80a8]\nComment:\n@default can you sync codegraph"
+	got := projectContextPrompt(message, "Project prerequisites (README.md head):", "codegraph: index exists (auto-sync active)", true)
+	if got != message {
+		t.Fatalf("continuation prompt was rewritten:\n%s", got)
+	}
+}
+
+func TestProjectContextPromptAddsContextOnFirstRun(t *testing.T) {
+	got := projectContextPrompt("implement feature", "Project prerequisites (README.md head):", "codegraph: index exists (auto-sync active)", false)
+	for _, want := range []string{"Project prerequisites (README.md head):", "codegraph: index exists", "Task:\nimplement feature"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("first-run prompt missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestRewriteShellCmd(t *testing.T) {
 	cases := []struct{ name, in string }{
 		{"known git", "git status"},
@@ -882,5 +899,25 @@ func TestPostResultGivesUpAfterThreeAttempts(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestTailscaleVersion(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"running", `{"Version":"1.102.2-t6cac91817-g6ff0ddc72","BackendState":"Running"}`, "1.102.2 (Running)"},
+		{"needs login", `{"Version":"1.80.0","BackendState":"NeedsLogin"}`, "1.80.0 (NeedsLogin)"},
+		{"stopped", `{"Version":"1.80.0","BackendState":"Stopped"}`, "1.80.0 (Stopped)"},
+		{"empty state", `{"Version":"1.80.0"}`, "1.80.0 (unknown)"},
+		{"no version", `{"BackendState":"Running"}`, "probe failed"},
+		{"not json", `tailscaled is not running`, "probe failed"},
+	}
+	for _, tc := range cases {
+		if got := tailscaleVersion([]byte(tc.in)); got != tc.want {
+			t.Errorf("%s: tailscaleVersion = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
