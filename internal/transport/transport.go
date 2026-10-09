@@ -53,6 +53,14 @@ type DispatchRequest struct {
 	HarnessKind string `json:"harness_kind,omitempty"`
 	// CommandCodeSessionID resumes the same Command Code session for task comments.
 	CommandCodeSessionID string `json:"commandcode_session_id,omitempty"`
+	// DSHPermissionMode is the sandbox/approval preset for a dsh run
+	// (read-only|workspace-write|danger-full-access). It maps to the
+	// DSH_PERMISSION_MODE env the dsh base patch reads. Empty leaves the dsh
+	// profile default (workspace-write).
+	DSHPermissionMode string `json:"dsh_permission_mode,omitempty"`
+	// CommandCodeMode selects the Command Code permission mode
+	// (standard|plan|accept-edits|yolo). Empty keeps the historical --yolo.
+	CommandCodeMode string `json:"commandcode_mode,omitempty"`
 	// OMPSessionID resumes the same omp session for task comments.
 	OMPSessionID string `json:"omp_session_id,omitempty"`
 	// ClaudeSessionID resumes the same Claude Code CLI session for task comments.

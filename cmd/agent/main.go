@@ -797,6 +797,11 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 		// launchd PATH omits Homebrew; dsh's shebang resolves node through env.
 		cmd.Env = dshCommandEnv()
+		// User-selected sandbox/approval preset. dsh-headless has no CLI flag for
+		// it; the base patch reads DSH_PERMISSION_MODE. danger-full-access maps
+		// approval to 'never', which is the only preset that runs unattended —
+		// the headless bundle mounts no approval answerer, so 'ask' fails closed.
+		cmd.Env = dshEnvWithPermission(cmd.Env, job.DSHPermissionMode)
 		if strings.TrimSpace(job.Model) != "" {
 			cmd.Env = append(cmd.Env, "DSH_MODEL="+strings.TrimSpace(job.Model))
 		}
@@ -2096,6 +2101,16 @@ func dshCommandEnv() []string {
 	return env
 }
 
+// dshEnvWithPermission appends the user-selected DSH_PERMISSION_MODE to a dsh
+// environment when set. Kept separate from dshCommandEnv so the mapping is
+// unit-testable without spawning dsh.
+func dshEnvWithPermission(env []string, mode string) []string {
+	if mode = strings.TrimSpace(mode); mode != "" {
+		env = append(env, "DSH_PERMISSION_MODE="+mode)
+	}
+	return env
+}
+
 // dshIsolatedHome returns the private DSH_HOME agent-dispatched headless runs
 // must use, creating it on first use. A user-owned `dsh web` daemon holds a
 // kernel flock lease on every session it has open, for the whole life of its
@@ -2715,9 +2730,25 @@ func deepSeekHarnessArgs(sessionID string) []string {
 
 // commandCodeArgs builds the headless Command Code invocation. A first run omits
 // --resume so the CLI mints a real session and returns its id; a continuation
-// resumes the exact session the control plane bound to this card.
+// resumes the exact session the control plane bound to this card. The
+// permission mode is user-selectable (standard|plan|accept-edits|yolo); an
+// empty mode keeps the historical --yolo so existing dispatches are unchanged.
 func commandCodeArgs(job transport.DispatchRequest, jsonOutput bool) []string {
-	args := []string{"-p", "--yolo", "--skip-onboarding"}
+	args := []string{"-p", "--skip-onboarding"}
+	switch strings.TrimSpace(job.CommandCodeMode) {
+	case "plan":
+		args = append(args, "--plan")
+	case "accept-edits":
+		args = append(args, "--accept-edits")
+	case "standard":
+		args = append(args, "--permission-mode", "standard")
+	case "yolo", "":
+		args = append(args, "--yolo")
+	default:
+		// Unknown mode fails safe to the historical default rather than
+		// emitting an unrecognized flag the CLI would reject.
+		args = append(args, "--yolo")
+	}
 	if jsonOutput {
 		args = append(args, "--output-format", "json")
 	} else {
