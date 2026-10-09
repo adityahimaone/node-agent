@@ -106,9 +106,18 @@ func main() {
 	wsPaths := loadWorkspaces()
 	executors, versions := detectExecutors()
 
-	register := func() error {
-		return postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: loadWorkspaces(), Executors: executors, Versions: versions})
+	// registerNow re-probes every tool version and re-registers from scratch.
+	// This is the agent's half of the Overview's "ping all versions" button:
+	// the server answers a heartbeat with refresh=true and this runs, so a
+	// version never has to go stale until the next agent restart. The
+	// poll-404 path uses it too, because a server that lost its registry
+	// should get fresh versions back, not the snapshot taken at boot.
+	registerNow := func() error {
+		execs, vers := detectExecutors()
+		ws := loadWorkspaces()
+		return postJSON(server+"/api/nodes/register", transport.RegisterRequest{NodeID: nodeID, Hostname: hostname(), Version: "0.3.0", Workspaces: ws, Executors: execs, Versions: vers, Transports: []string{"http"}})
 	}
+	register := registerNow
 	transportMode := strings.ToLower(strings.TrimSpace(os.Getenv("NODE_AGENT_TRANSPORT")))
 	if transportMode == "" {
 		transportMode = "auto"
@@ -128,7 +137,7 @@ func main() {
 	}
 	log.Printf("registered %s transport=http workspaces=%v", nodeID, wsPaths)
 
-	go heartbeatLoop(server, nodeID)
+	go heartbeatLoop(server, nodeID, registerNow)
 
 	for {
 		req, _ := http.NewRequest("GET", server+"/api/nodes/"+nodeID+"/poll", nil)
@@ -196,10 +205,10 @@ func main() {
 	}
 }
 
-func heartbeatLoop(server, nodeID string) {
+func heartbeatLoop(server, nodeID string, reRegister func() error) {
 	dshCache := heartbeat.NewDSHProbeCache(60 * time.Second)
 	for {
-		time.Sleep(15 * time.Second)
+		time.Sleep(heartbeatInterval)
 		status := "idle"
 		if atomic.LoadInt32(&busy) == 1 {
 			status = "busy"
@@ -209,8 +218,45 @@ func heartbeatLoop(server, nodeID string) {
 			h := dshCache.Get(dshBin)
 			dsh = &h
 		}
-		_ = postJSON(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: status, DSHHealth: dsh})
+		refresh, err := heartbeatOnce(server, nodeID, status, dsh)
+		if err != nil {
+			continue
+		}
+		if refresh && reRegister != nil {
+			if err := reRegister(); err != nil {
+				log.Printf("refresh re-register: %v", err)
+			} else {
+				log.Printf("refresh: re-probed versions and re-registered %s", nodeID)
+			}
+		}
 	}
+}
+
+// heartbeatInterval is how often a worker reports liveness. It also bounds how
+// long the Overview's "ping all versions" takes to reach a worker, because the
+// refresh request is delivered on the heartbeat response. A variable so tests
+// do not wait it out.
+var heartbeatInterval = 15 * time.Second
+
+// heartbeatOnce posts one heartbeat and reports whether the server asked for a
+// version re-probe. Only a literal JSON `refresh: true` counts: an older
+// server answers `{"status":"ok"}` (and some middleboxes answer HTML), and
+// re-registering on an unparsable body would hammer the control plane.
+func heartbeatOnce(server, nodeID, status string, dsh *heartbeat.DSHHealth) (bool, error) {
+	body, err := postJSONBody(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: status, DSHHealth: dsh})
+	if err != nil {
+		return false, err
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return false, nil
+	}
+	var resp struct {
+		Refresh bool `json:"refresh"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false, nil
+	}
+	return resp.Refresh, nil
 }
 
 func contains(s, sub string) bool { return bytes.Contains([]byte(s), []byte(sub)) }
@@ -396,10 +442,17 @@ func (e *eventEmitter) Close() {
 }
 
 func postJSON(url string, v any) error {
+	_, err := postJSONBody(url, v)
+	return err
+}
+
+// postJSONBody is postJSON plus the response body. The heartbeat needs the
+// body (it carries the re-probe request); every other caller ignores it.
+func postJSONBody(url string, v any) ([]byte, error) {
 	b, _ := json.Marshal(v)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if agentToken != "" {
@@ -407,14 +460,14 @@ func postJSON(url string, v any) error {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		bb := readAll(resp)
-		return fmt.Errorf("%d %s", resp.StatusCode, string(bb))
+		return nil, fmt.Errorf("%d %s", resp.StatusCode, string(bb))
 	}
-	return nil
+	return readAll(resp), nil
 }
 
 // resultPostBackoff is the pause between result-delivery
@@ -1622,22 +1675,29 @@ func commandFor(ctx context.Context, bin string, args ...string) *exec.Cmd {
 }
 
 func detectExecutors() ([]string, map[string]string) {
+	// `strict` marks a probe whose launcher can exit 0 while printing a
+	// diagnosis instead of a release: the Windows Command Code shim answers
+	// an old Node with an upgrade walkthrough, and "it printed something"
+	// must not read as connected in the Overview.
 	checks := []struct {
-		name string
-		bins []string
+		name   string
+		bins   []string
+		strict bool
+		node   bool
 	}{
-		{"hermes", []string{"hermes"}}, {"codex", []string{"codex"}},
-		{"dsh", []string{"dsh"}},
-		{"commandcode", commandCodeBinNames()},
-		{"omp", []string{"omp"}},
-		{"claude", []string{"claude"}},
+		{name: "hermes", bins: []string{"hermes"}},
+		{name: "codex", bins: []string{"codex"}},
+		{name: "dsh", bins: []string{"dsh"}, node: true},
+		{name: "commandcode", bins: commandCodeBinNames(), strict: true, node: true},
+		{name: "omp", bins: []string{"omp"}},
+		{name: "claude", bins: []string{"claude"}},
 	}
 	var out []string
 	versions := map[string]string{}
 	for _, c := range checks {
 		if bin := findBinAny(c.bins...); bin != "" {
 			out = append(out, c.name)
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout(c.node))
 			cmd := commandFor(ctx, bin, "--version")
 			if c.name == "dsh" {
 				cmd.Env = dshCommandEnv()
@@ -1648,58 +1708,192 @@ func detectExecutors() ([]string, map[string]string) {
 			}
 			b, err := cmd.CombinedOutput()
 			cancel()
-			if err != nil {
-				versions[c.name] = "probe failed"
-			} else {
-				versions[c.name] = strings.TrimSpace(string(b))
-			}
+			versions[c.name] = probeVersion(b, err, c.strict)
 		}
 	}
-	// codegraph is workspace preflight context, not a dispatchable executor.
-	probes := []struct {
-		name string
-		bins []string
-	}{
-		{"codegraph", []string{"codegraph"}},
-		{"pen-dev", []string{"pen"}},
-		{"e2e", []string{"playwright"}},
-		{"git", []string{"git"}},
-	}
-	for _, probe := range probes {
-		if bin := findBinAny(probe.bins...); bin != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			cmd := commandFor(ctx, bin, "--version")
-			b, err := cmd.CombinedOutput()
-			cancel()
-			if err != nil {
-				versions[probe.name] = "probe failed"
-			} else {
-				versions[probe.name] = strings.TrimSpace(string(b))
-			}
+	for _, probe := range toolProbes {
+		bin := findBinAny(probe.bins...)
+		if bin == "" {
+			continue
 		}
+		versions[probe.name] = runToolProbe(bin, probe)
 	}
-	if versions["dsh"] != "" {
-		versions["deepseek"] = versions["dsh"]
-	}
-	// tailscale is the fleet's fabric rather than a dispatchable
-	// tool, so it probes the daemon's status JSON: one response
-	// carries both the release and the tailnet state the Overview
-	// reads as connection health, and a daemon that is down fails
-	// the probe outright.
-	if bin := findBinAny("tailscale"); bin != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		cmd := commandFor(ctx, bin, "status", "--json")
-		b, err := cmd.CombinedOutput()
-		cancel()
-		if err != nil {
-			versions["tailscale"] = "probe failed"
-		} else {
-			versions["tailscale"] = tailscaleVersion(b)
-		}
+	if v := versions["dsh"]; v != "" && !strings.HasPrefix(v, "probe failed") {
+		versions["deepseek"] = v
 	}
 	versions["node-agent"] = "0.3.0"
 	out = append(out, "shell")
 	return out, versions
+}
+
+// toolProbe is one entry of the Overview's integration catalog: the tools
+// that are not dispatchable executors but whose presence and release the
+// fleet card reports per worker device.
+type toolProbe struct {
+	name   string
+	bins   []string
+	args   []string
+	// node marks a tool installed as a Node CLI: its shebang resolves `node`
+	// through PATH, which launchd does not carry, so the probe runs with the
+	// same PATH prepend the dispatch path uses.
+	node   bool
+	strict bool
+}
+
+// probes run in catalog order; a tool missing from this list reports as
+// "not installed" on every worker forever, which is how git and codegraph
+// stayed red while installed on both machines.
+var toolProbes = []toolProbe{
+	{name: "codegraph", bins: []string{"codegraph"}, args: []string{"--version"}},
+	{name: "pen-dev", bins: []string{"pen"}, args: []string{"--version"}, node: true},
+	{name: "e2e", bins: []string{"playwright"}, args: []string{"--version"}, node: true},
+	{name: "git", bins: []string{"git"}, args: []string{"--version"}},
+	// tailscale is the fleet's fabric rather than a dispatchable tool, so it
+	// probes the daemon's status JSON: one response carries both the release
+	// and the tailnet state the Overview reads as connection health, and a
+	// daemon that is down fails the probe outright.
+	{name: "tailscale", bins: []string{"tailscale"}, args: []string{"status", "--json"}},
+}
+
+// runToolProbe executes one catalog probe and normalizes its output.
+func runToolProbe(bin string, probe toolProbe) string {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout(probe.node))
+	defer cancel()
+	cmd := commandFor(ctx, bin, probe.args...)
+	if probe.node {
+		cmd.Env = nodeLauncherEnv()
+	}
+	b, err := cmd.CombinedOutput()
+	if probe.name == "tailscale" {
+		if err == nil {
+			if v := tailscaleVersion(b); !strings.HasPrefix(v, "probe failed") {
+				return v
+			}
+		}
+		// macOS ships Tailscale as a GUI app whose bundled CLI only answers
+		// inside a logged-in GUI session: from a launchd agent it fails with
+		// "The Tailscale GUI failed to start", and the status probe has no
+		// daemon to ask. The bundle still carries the release, and the app
+		// process being alive is what the daemon being up looks like from
+		// outside, so report that rather than a red dot for a working tailnet.
+		if runtime.GOOS == "darwin" {
+			return tailscaleDarwinFallback(darwinTailscaleRelease(bin), darwinTailscaleRunning())
+		}
+		return "probe failed"
+	}
+	version := probeVersion(b, err, probe.strict)
+	// A Node CLI answers `--version` only by luck: pen.dev rejects the flag
+	// ("--out or --export is required") after printing its update banner, so
+	// the installed package is where its release is actually written down.
+	if probe.node && strings.HasPrefix(version, "probe failed") {
+		if release := npmGlobalRelease(bin); release != "" {
+			return release
+		}
+	}
+	return version
+}
+
+// probeTimeout gives a Node CLI a longer leash than a native binary: it pays
+// interpreter startup plus its own update check before it answers, and a 2s
+// cap turned a working install into "probe failed" on the first cold run.
+func probeTimeout(node bool) time.Duration {
+	if node {
+		return 8 * time.Second
+	}
+	return 2 * time.Second
+}
+
+// npmGlobalRelease reads the release of a globally installed npm CLI from the
+// package.json its bin symlink resolves into, walking up from the entry point.
+// It returns "" when the bin is not a symlink into a package.
+func npmGlobalRelease(bin string) string {
+	target, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		return ""
+	}
+	// Entry points live a couple of levels inside the package (dist/index.mjs),
+	// so walk up a bounded number of parents and stop at the first manifest.
+	dir := filepath.Dir(target)
+	for i := 0; i < 4; i++ {
+		raw, err := os.ReadFile(filepath.Join(dir, "package.json"))
+		if err == nil {
+			var meta struct {
+				Version string `json:"version"`
+			}
+			if json.Unmarshal(raw, &meta) != nil {
+				return ""
+			}
+			return strings.TrimSpace(meta.Version)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// tailscaleDarwinFallback renders the two answers available on macOS without
+// the daemon in the same "<release> (<state>)" shape the status probe emits.
+func tailscaleDarwinFallback(release string, running bool) string {
+	release = strings.TrimSpace(release)
+	if release == "" {
+		return "probe failed"
+	}
+	if running {
+		return release + " (Running)"
+	}
+	return release + " (Stopped)"
+}
+
+// darwinTailscaleRelease reads the release out of the app bundle the CLI
+// belongs to, because the bundled CLI cannot answer a version query there.
+func darwinTailscaleRelease(bin string) string {
+	idx := strings.Index(bin, ".app/")
+	if idx < 0 {
+		return ""
+	}
+	plist := filepath.Join(bin[:idx+len(".app")], "Contents", "Info.plist")
+	out, err := exec.Command("defaults", "read", plist, "CFBundleShortVersionString").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// darwinTailscaleRunning reports whether the Tailscale app process is up.
+func darwinTailscaleRunning() bool {
+	return exec.Command("pgrep", "-f", "Tailscale.app/Contents/MacOS/Tailscale").Run() == nil
+}
+
+// versionHead matches a first line that LEADS with a release, optionally
+// behind a tool name. It is what strict probes require: a line of prose that
+// merely mentions a version ("... you're on v14.15.1.") does not lead with
+// one, so it is a diagnosis rather than a release.
+var versionHead = regexp.MustCompile(`^(?:\S+\s+)?v?\d+\.\d+`)
+
+// probeVersion normalizes a `--version` probe into the one line the Overview
+// shows per integration.
+//
+// A probe that failed, printed nothing, or answered with prose instead of a
+// release must never read as connected: the "probe failed" prefix turns the
+// Overview dot red and whatever follows it is the reason shown in the tooltip.
+// Everything after the first line is dropped — the card has room for a word
+// and a number, not a changelog.
+func probeVersion(out []byte, err error, strict bool) string {
+	text := strings.TrimSpace(string(out))
+	if err != nil || text == "" {
+		return "probe failed"
+	}
+	line := text
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		line = strings.TrimSpace(text[:i])
+	}
+	if strict && !versionHead.MatchString(line) {
+		return "probe failed: " + line
+	}
+	return line
 }
 
 // tailscaleVersion renders the status JSON for the Integration
@@ -1940,8 +2134,11 @@ func dshIsolatedHome() string {
 }
 
 func findBin(name string) string {
-	for _, p := range []string{os.ExpandEnv("$HOME/.local/bin/" + name), "/opt/homebrew/bin/" + name, "/usr/local/bin/" + name} {
-		if _, err := os.Stat(p); err == nil {
+	for _, p := range binCandidates(runtime.GOOS, os.Getenv, name) {
+		if p == "" {
+			continue
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
 	}
@@ -1949,6 +2146,53 @@ func findBin(name string) string {
 		return b
 	}
 	return ""
+}
+
+// binCandidates lists the absolute paths a tool can live at on a platform.
+//
+// findBin walks these before LookPath because the agent runs under launchd
+// (macOS) and a scheduled task (Windows), whose PATH is minimal: Homebrew,
+// ~/.local/bin, the Tailscale app bundle on macOS and the per-user tool
+// installs on Windows are all invisible to that PATH — which is why
+// tailscale, codegraph and git read as "not installed" while installed.
+//
+// goos and getenv are parameters so the platform rules stay testable from
+// a host of any other platform.
+func binCandidates(goos string, getenv func(string) string, name string) []string {
+	home := getenv("HOME")
+	if home == "" {
+		home = getenv("USERPROFILE")
+	}
+	var paths []string
+	if home != "" {
+		paths = append(paths, filepath.Join(home, ".local", "bin", name))
+	}
+	paths = append(paths, "/opt/homebrew/bin/"+name, "/usr/local/bin/"+name)
+
+	if goos == "windows" {
+		local := getenv("LOCALAPPDATA")
+		paths = append(paths,
+			// Per-user tool installs, e.g. %LOCALAPPDATA%\codegraph\current\bin.
+			filepath.Join(local, name, "current", "bin", name+".cmd"),
+			filepath.Join(local, "Programs", name, name+".exe"),
+			filepath.Join(local, name+".exe"),
+			filepath.Join(getenv("APPDATA"), "npm", name+".cmd"),
+			filepath.Join(getenv("ProgramFiles"), name, name+".exe"),
+		)
+	}
+
+	// Tailscale is the one catalog tool that ships as an app bundle (macOS)
+	// and under a capitalised Program Files directory (Windows), so neither
+	// the plain name nor the plain directory finds it.
+	if name == "tailscale" {
+		switch goos {
+		case "darwin":
+			paths = append(paths, "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+		case "windows":
+			paths = append(paths, filepath.Join(getenv("ProgramFiles"), "Tailscale", "tailscale.exe"))
+		}
+	}
+	return paths
 }
 
 func streamCommand(cmd *exec.Cmd, taskID string) ([]byte, error) {

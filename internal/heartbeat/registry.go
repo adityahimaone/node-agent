@@ -23,9 +23,52 @@ type Registry struct {
 	mu    sync.RWMutex
 	nodes map[string]*Node
 	ttl   time.Duration
+	// refresh holds nodes that have been asked to re-probe their tool
+	// versions. The request reaches a worker through its next heartbeat
+	// response, so the flag lives here until it is consumed. A worker that
+	// never beats (offline) keeps its flag harmlessly set.
+	refresh map[string]bool
 }
 
-func New(ttl time.Duration) *Registry { return &Registry{nodes: map[string]*Node{}, ttl: ttl} }
+func New(ttl time.Duration) *Registry {
+	return &Registry{nodes: map[string]*Node{}, ttl: ttl, refresh: map[string]bool{}}
+}
+
+// RequestRefresh marks every known node for a version re-probe and returns how
+// many were marked. Offline nodes are marked too: their flag is delivered when
+// they come back rather than being lost.
+func (r *Registry) RequestRefreshAll() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id := range r.nodes {
+		r.refresh[id] = true
+	}
+	return len(r.nodes)
+}
+
+// RequestRefresh marks one node. It reports false for an unknown node so the
+// caller can 404 instead of silently queueing work nobody will do.
+func (r *Registry) RequestRefresh(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.nodes[id]; !ok {
+		return false
+	}
+	r.refresh[id] = true
+	return true
+}
+
+// ConsumeRefresh reports whether id was asked to re-probe and clears the flag.
+// Clearing is what keeps a worker from re-registering on every heartbeat.
+func (r *Registry) ConsumeRefresh(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.refresh[id] {
+		return false
+	}
+	delete(r.refresh, id)
+	return true
+}
 
 func (r *Registry) Upsert(n *Node) {
 	r.mu.Lock()

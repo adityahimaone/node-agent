@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -919,5 +921,154 @@ func TestTailscaleVersion(t *testing.T) {
 		if got := tailscaleVersion([]byte(tc.in)); got != tc.want {
 			t.Errorf("%s: tailscaleVersion = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// The Overview renders one word and one version per integration, so a probe
+// has to collapse into a single line and must never let "it printed
+// something" stand in for health.
+func TestProbeVersion(t *testing.T) {
+	cases := []struct {
+		name   string
+		out    string
+		err    bool
+		strict bool
+		want   string
+	}{
+		{name: "single line release", out: "1.75.1", want: "1.75.1"},
+		{name: "keeps the first of several lines", out: "codegraph 1.6.0\nbuilt from source", want: "codegraph 1.6.0"},
+		{name: "blank output is a failed probe", out: "  \n", want: "probe failed"},
+		{name: "exec error is a failed probe", out: "boom", err: true, want: "probe failed"},
+		{name: "git spells its release out", out: "git version 2.46.0.windows.1", want: "git version 2.46.0.windows.1"},
+		{
+			// The Windows Command Code shim exits 0 after printing an
+			// upgrade walkthrough, so strict mode has to reject the prose
+			// and keep the reason for the tooltip.
+			name:   "strict rejects a walkthrough",
+			out:    "Command Code needs Node.js 22 or newer — you're on v14.15.1.\n\nInstall the current Node LTS, then run cmd again:\n\n  n    npm install -g n && n lts\n",
+			strict: true,
+			want:   "probe failed: Command Code needs Node.js 22 or newer — you're on v14.15.1.",
+		},
+		{name: "strict accepts a release", out: "1.75.1", strict: true, want: "1.75.1"},
+		{name: "strict passes a failed probe through", out: "", strict: true, want: "probe failed"},
+	}
+	for _, tc := range cases {
+		var err error
+		if tc.err {
+			err = errors.New("exit status 1")
+		}
+		if got := probeVersion([]byte(tc.out), err, tc.strict); got != tc.want {
+			t.Errorf("%s: probeVersion = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Tools installed where launchd and the Windows scheduled task cannot see
+// them: the Tailscale app bundle on macOS, the per-user installs on Windows.
+func TestBinCandidatesPlatformPaths(t *testing.T) {
+	getenv := func(key string) string {
+		return map[string]string{
+			"HOME":         "/Users/tester",
+			"LOCALAPPDATA": `C:\Users	ester\AppData\Local`,
+			"APPDATA":      `C:\Users	ester\AppData\Roaming`,
+			"ProgramFiles": `C:\Program Files`,
+		}[key]
+	}
+
+	darwin := binCandidates("darwin", getenv, "tailscale")
+	if !slices.Contains(darwin, "/Applications/Tailscale.app/Contents/MacOS/Tailscale") {
+		t.Errorf("darwin candidates miss the Tailscale app bundle: %v", darwin)
+	}
+	if !slices.Contains(darwin, "/Users/tester/.local/bin/tailscale") {
+		t.Errorf("darwin candidates miss ~/.local/bin: %v", darwin)
+	}
+
+	windows := binCandidates("windows", getenv, "codegraph")
+	for _, want := range []string{
+		filepath.Join(`C:\Users	ester\AppData\Local`, "codegraph", "current", "bin", "codegraph.cmd"),
+		filepath.Join(`C:\Users	ester\AppData\Roaming`, "npm", "codegraph.cmd"),
+		filepath.Join(`C:\Program Files`, "codegraph", "codegraph.exe"),
+	} {
+		if !slices.Contains(windows, want) {
+			t.Errorf("windows candidates miss %s: %v", want, windows)
+		}
+	}
+
+	tailscaleWindows := binCandidates("windows", getenv, "tailscale")
+	if want := filepath.Join(`C:\Program Files`, "Tailscale", "tailscale.exe"); !slices.Contains(tailscaleWindows, want) {
+		t.Errorf("windows candidates miss the Tailscale install (%s): %v", want, tailscaleWindows)
+	}
+}
+
+// The Overview's catalog is driven by the probe list: a tool that is never
+// probed reads as "not installed" forever, which is how git and codegraph
+// stayed red while installed on both workers.
+func TestToolProbesCoverOverviewCatalog(t *testing.T) {
+	var names []string
+	for _, probe := range toolProbes {
+		names = append(names, probe.name)
+	}
+	for _, want := range []string{"codegraph", "pen-dev", "e2e", "git", "tailscale"} {
+		if !slices.Contains(names, want) {
+			t.Errorf("toolProbes missing %s: %v", want, names)
+		}
+	}
+}
+
+// macOS reaches tailscale through a GUI-app CLI that refuses to answer from a
+// launchd agent; the bundle release plus the app process is the honest
+// substitute, and an unresolvable release must still read as a failed probe.
+func TestTailscaleDarwinFallback(t *testing.T) {
+	cases := []struct {
+		name    string
+		release string
+		running bool
+		want    string
+	}{
+		{name: "running app", release: "1.102.4\n", running: true, want: "1.102.4 (Running)"},
+		{name: "app not running", release: "1.102.4", running: false, want: "1.102.4 (Stopped)"},
+		{name: "no release is a failed probe", release: "  ", running: true, want: "probe failed"},
+	}
+	for _, tc := range cases {
+		if got := tailscaleDarwinFallback(tc.release, tc.running); got != tc.want {
+			t.Errorf("%s: tailscaleDarwinFallback = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A Node CLI answers `--version` only by luck: pen.dev prints an update banner
+// and rejects the flag, so its release has to come from the installed package.
+func TestNpmGlobalRelease(t *testing.T) {
+	root := t.TempDir()
+	pkg := filepath.Join(root, "lib", "node_modules", "@pen.dev", "cli")
+	if err := os.MkdirAll(filepath.Join(pkg, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@pen.dev/cli","version":"0.3.10"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(pkg, "dist", "index.mjs")
+	if err := os.WriteFile(entry, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(binDir, "pen")
+	if err := os.Symlink(entry, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := npmGlobalRelease(link); got != "0.3.10" {
+		t.Errorf("npmGlobalRelease = %q, want 0.3.10", got)
+	}
+
+	// A native binary is not a symlink into a package: no release to read.
+	native := filepath.Join(binDir, "git")
+	if err := os.WriteFile(native, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := npmGlobalRelease(native); got != "" {
+		t.Errorf("npmGlobalRelease for a native bin = %q, want empty", got)
 	}
 }
