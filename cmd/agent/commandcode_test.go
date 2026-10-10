@@ -29,6 +29,23 @@ func TestCommandCodeArgsContinuationResumesBoundSession(t *testing.T) {
 	}
 }
 
+func TestCommandCodeArgsModeSelectable(t *testing.T) {
+	cases := []struct{ mode, want string }{
+		{"", "--yolo"},
+		{"yolo", "--yolo"},
+		{"plan", "--plan"},
+		{"accept-edits", "--accept-edits"},
+		{"standard", "--permission-mode standard"},
+		{"bogus", "--yolo"},
+	}
+	for _, tc := range cases {
+		joined := strings.Join(commandCodeArgs(transport.DispatchRequest{CommandCodeMode: tc.mode}, true), " ")
+		if !strings.Contains(joined, tc.want) {
+			t.Fatalf("mode %q -> %s, want %q", tc.mode, joined, tc.want)
+		}
+	}
+}
+
 func TestCommandCodeArgsTextFallbackDropsJSONFlag(t *testing.T) {
 	args := commandCodeArgs(transport.DispatchRequest{CommandCodeSessionID: "cc-1"}, false)
 	joined := strings.Join(args, " ")

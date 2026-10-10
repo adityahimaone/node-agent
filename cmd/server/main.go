@@ -225,6 +225,13 @@ func main() {
 	r.Get("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
 		transport.WriteJSON(w, 200, reg.List())
 	})
+	// Every worker re-probes its tool versions when asked. The request rides
+	// along on the next heartbeat response (see the heartbeat handler), which
+	// is how the Overview's "ping all versions" button refreshes versions
+	// without restarting the agents on mac and windows.
+	r.Post("/api/nodes/refresh", func(w http.ResponseWriter, r *http.Request) {
+		transport.WriteJSON(w, 200, map[string]any{"status": "ok", "requested": reg.RequestRefreshAll()})
+	})
 	r.Post("/api/nodes/register", func(w http.ResponseWriter, r *http.Request) {
 		var req transport.RegisterRequest
 		if err := transport.ReadJSON(r, &req); err != nil {
@@ -248,7 +255,10 @@ func main() {
 			http.Error(w, "unknown node", 404)
 			return
 		}
-		transport.WriteJSON(w, 200, map[string]string{"status": "ok"})
+		// refresh=true is the agent's cue to re-probe versions and
+		// re-register; the flag is consumed here so only one heartbeat is
+		// answered with it.
+		transport.WriteJSON(w, 200, map[string]any{"status": "ok", "refresh": reg.ConsumeRefresh(id)})
 	})
 	r.Get("/api/nodes/{id}/poll", func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
