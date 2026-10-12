@@ -1684,8 +1684,12 @@ func detectExecutors() ([]string, map[string]string) {
 		bins   []string
 		strict bool
 		node   bool
+		// slow marks a probe whose launcher pays interpreter startup before it
+		// answers: hermes is a Python entrypoint that cold-starts in 1-4.5s,
+		// so the 2s native leash turned a working install into "probe failed".
+		slow bool
 	}{
-		{name: "hermes", bins: []string{"hermes"}},
+		{name: "hermes", bins: []string{"hermes"}, slow: true},
 		{name: "codex", bins: []string{"codex"}},
 		{name: "dsh", bins: []string{"dsh"}, node: true},
 		{name: "commandcode", bins: commandCodeBinNames(), strict: true, node: true},
@@ -1697,7 +1701,7 @@ func detectExecutors() ([]string, map[string]string) {
 	for _, c := range checks {
 		if bin := findBinAny(c.bins...); bin != "" {
 			out = append(out, c.name)
-			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout(c.node))
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout(c.node || c.slow))
 			cmd := commandFor(ctx, bin, "--version")
 			if c.name == "dsh" {
 				cmd.Env = dshCommandEnv()
@@ -2142,10 +2146,45 @@ func findBin(name string) string {
 			return p
 		}
 	}
+	// Version managers install per-runtime, not at a fixed path: nvm keeps one
+	// bin dir per Node version and a launchd agent (PATH /usr/bin:/bin) can
+	// never see any of them, which is how claude — installed only under
+	// ~/.nvm/versions/node/v22 — stayed invisible to the fleet. Glob the
+	// version-manager roots so such a tool is found like a Homebrew one.
+	for _, pattern := range versionManagerCandidates(os.Getenv("HOME"), name) {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if st, err := os.Stat(m); err == nil && !st.IsDir() {
+				return m
+			}
+		}
+	}
 	if b, err := exec.LookPath(name); err == nil {
 		return b
 	}
 	return ""
+}
+
+// versionManagerCandidates returns glob patterns for the per-user version
+// managers that install a tool outside the fixed bin dirs. Each pattern is
+// expanded by findBin; a name absent from a manager's tree simply yields no
+// match. Patterns are tried in order, so an nvm install wins over an asdf shim.
+func versionManagerCandidates(home, name string) []string {
+	if home == "" {
+		return nil
+	}
+	return []string{
+		// nvm: one bin dir per installed Node version. filepath.Glob sorts
+		// ascending, so an older version with the same tool would win; the
+		// fix for that is to honour the nvm `alias/default`, not guessed here.
+		filepath.Join(home, ".nvm", "versions", "node", "*", "bin", name),
+		filepath.Join(home, ".volta", "bin", name),
+		filepath.Join(home, ".asdf", "shims", name),
+		filepath.Join(home, ".local", "share", "fnm", "aliases", "*", "bin", name),
+	}
 }
 
 // binCandidates lists the absolute paths a tool can live at on a platform.

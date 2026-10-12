@@ -1072,3 +1072,58 @@ func TestNpmGlobalRelease(t *testing.T) {
 		t.Errorf("npmGlobalRelease for a native bin = %q, want empty", got)
 	}
 }
+
+// hermes is a Python entrypoint that cold-starts in 1-4.5s, so the 2s native
+// leash reported a working install as "probe failed". It must ride the long
+// timeout the Node CLIs use.
+func TestProbeTimeoutGivesInterpreterLaunchersALongLeash(t *testing.T) {
+	if got := probeTimeout(true); got != 8*time.Second {
+		t.Fatalf("probeTimeout(true) = %v, want 8s", got)
+	}
+	if got := probeTimeout(false); got != 2*time.Second {
+		t.Fatalf("probeTimeout(false) = %v, want 2s", got)
+	}
+}
+
+// A tool installed through nvm lives at ~/.nvm/versions/node/<v>/bin/<name>,
+// which neither the fixed bin dirs nor the launchd PATH can reach. findBin
+// must resolve it, or claude stays invisible to the fleet.
+func TestFindBinResolvesVersionManagerInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// No fixed-dir copy, only the nvm tree.
+	bin := filepath.Join(home, ".nvm", "versions", "node", "v22.23.3", "bin", "claude")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := findBin("claude"); got != bin {
+		t.Fatalf("findBin(claude) = %q, want %q", got, bin)
+	}
+
+	// A tool present in no manager's tree is still not found.
+	if got := findBin("definitely-not-installed-xyz"); got != "" {
+		t.Fatalf("findBin for a missing tool = %q, want empty", got)
+	}
+}
+
+// The glob patterns are the contract: a manager whose root is dropped from the
+// list silently stops resolving its tools.
+func TestVersionManagerCandidatesCoverNvmVoltaAsdf(t *testing.T) {
+	got := versionManagerCandidates("/Users/tester", "claude")
+	for _, want := range []string{
+		filepath.Join("/Users/tester", ".nvm", "versions", "node", "*", "bin", "claude"),
+		filepath.Join("/Users/tester", ".volta", "bin", "claude"),
+		filepath.Join("/Users/tester", ".asdf", "shims", "claude"),
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("versionManagerCandidates missing %s: %v", want, got)
+		}
+	}
+	if versionManagerCandidates("", "claude") != nil {
+		t.Error("no HOME must yield no candidates, not a pattern rooted at the cwd")
+	}
+}
