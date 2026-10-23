@@ -327,7 +327,7 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, DSHPermissionMode: job.DSHPermissionMode, CommandCodeMode: job.CommandCodeMode, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow, TimeoutS: job.TimeoutS}, func(phase, message string) {
+		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Effort: job.Effort, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, DSHPermissionMode: job.DSHPermissionMode, CommandCodeMode: job.CommandCodeMode, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow, TimeoutS: job.TimeoutS}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
@@ -814,9 +814,7 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 			permMode = "danger-full-access"
 		}
 		cmd.Env = dshEnvWithPermission(cmd.Env, permMode)
-		if strings.TrimSpace(job.Model) != "" {
-			cmd.Env = append(cmd.Env, "DSH_MODEL="+strings.TrimSpace(job.Model))
-		}
+		cmd.Env = dshEnvWithModelAndEffort(cmd.Env, job.Provider, job.Model, job.Effort)
 	case "commandcode":
 		bin := commandCodeBin()
 		if bin == "" {
@@ -2138,6 +2136,50 @@ func dshEnvWithPermission(env []string, mode string) []string {
 	return env
 }
 
+// dshEnvWithModelAndEffort maps the dispatched provider, model, and effort into
+// DSH_PROVIDER, DSH_MODEL, and DSH_REASONING_EFFORT environment variables read
+// by the headless profile's agent-default-model patch.
+func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []string {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if strings.HasPrefix(model, "deepseek-account:") {
+		provider = "deepseek-account"
+		model = strings.TrimPrefix(model, "deepseek-account:")
+	} else if strings.HasPrefix(model, "adit-9router:") {
+		provider = "adit-9router"
+		model = strings.TrimPrefix(model, "adit-9router:")
+	} else if strings.HasPrefix(model, "adit-9router/") {
+		provider = "adit-9router"
+		model = strings.TrimPrefix(model, "adit-9router/")
+	}
+	if model == "deepseek-v4.1-flash" || model == "deepseek/deepseek-v4.1-flash" || model == "deepseek-v4-flash" {
+		if provider == "" || provider == "deepseek-account" || provider == "deepseek" {
+			model = "deepseek-flash"
+			provider = "deepseek-account"
+		}
+	} else if model == "deepseek-flash" || model == "deepseek-v4-pro" {
+		if provider == "" || provider == "deepseek" {
+			provider = "deepseek-account"
+		}
+	} else if model != "" && (provider == "" || provider == "deepseek") {
+		provider = "adit-9router"
+	}
+	if provider != "" {
+		env = append(env, "DSH_PROVIDER="+provider)
+	}
+	if model != "" {
+		env = append(env, "DSH_MODEL="+model)
+	}
+	switch effort {
+	case "off", "low", "high", "max":
+		env = append(env, "DSH_REASONING_EFFORT="+effort)
+	case "medium":
+		env = append(env, "DSH_REASONING_EFFORT=high")
+	}
+	return env
+}
+
 // dshIsolatedHome returns the private DSH_HOME agent-dispatched headless runs
 // must use, creating it on first use. A user-owned `dsh web` daemon holds a
 // kernel flock lease on every session it has open, for the whole life of its
@@ -2785,6 +2827,15 @@ func commandCodeArgs(job transport.DispatchRequest, jsonOutput bool) []string {
 		args = append(args, "--output-format", "json")
 	} else {
 		args = append(args, "--output-format", "text")
+	}
+	if model := strings.TrimSpace(job.Model); model != "" && !strings.EqualFold(model, "default") && !strings.EqualFold(model, "auto") {
+		args = append(args, "-m", model)
+	}
+	switch strings.ToLower(strings.TrimSpace(job.Effort)) {
+	case "low", "medium", "high":
+		args = append(args, "--effort", strings.ToLower(strings.TrimSpace(job.Effort)))
+	case "max":
+		args = append(args, "--effort", "high")
 	}
 	if sessionID := strings.TrimSpace(job.CommandCodeSessionID); sessionID != "" {
 		args = append(args, "--resume", sessionID)

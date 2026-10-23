@@ -80,6 +80,7 @@ type DispatchJob struct {
 	MaxIterations        int    `json:"max_iterations,omitempty"`
 	Acceptance           string `json:"acceptance,omitempty"`
 	Model                string `json:"model"`
+	Effort               string `json:"effort,omitempty"`
 	Provider             string `json:"provider"`
 	PrequestNote         string `json:"prequest_note"`
 	DSHSessionID         string `json:"dsh_session_id,omitempty"`

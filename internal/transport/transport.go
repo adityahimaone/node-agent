@@ -36,6 +36,7 @@ type DispatchRequest struct {
 	Message       string `json:"message"`
 	Workspace     string `json:"workspace"` // absolute path on agent
 	Model         string `json:"model"`
+	Effort        string `json:"effort,omitempty"`
 	Provider      string `json:"provider"`
 	Executor      string `json:"executor,omitempty"`       // auto|hermes|codex|commandcode|omp|shell
 	Command       string `json:"command,omitempty"`        // only used by shell executor
