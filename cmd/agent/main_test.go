@@ -18,6 +18,9 @@ import (
 func mustTempDir(t *testing.T) string {
 	t.Helper()
 	d := t.TempDir()
+	if canonical, err := filepath.EvalSymlinks(d); err == nil && canonical != "" {
+		d = canonical
+	}
 	if err := os.WriteFile(filepath.Join(d, "probe.txt"), []byte("ok"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +209,37 @@ func TestDSHCommandEnvIsolatesSessionHome(t *testing.T) {
 	sessions := filepath.Join(iso, "sessions")
 	if fi, err := os.Lstat(sessions); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("isolated home must not share the user's session store: %s", sessions)
+	}
+}
+
+func TestDSHIsolatedHomeReplacesStaleNonSymlinkCopies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NODE_AGENT_DSH_HOME", "")
+	if err := os.MkdirAll(filepath.Join(home, ".dsh", "profiles", "headless"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".dsh", ".credentials.yaml"), []byte("fresh: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	iso := filepath.Join(home, ".dsh-nodeagent")
+	if err := os.MkdirAll(filepath.Join(iso, "profiles", "headless"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(iso, ".credentials.yaml"), []byte("stale: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := dshIsolatedHome(); got != iso {
+		t.Fatalf("dshIsolatedHome() = %q, want %q", got, iso)
+	}
+	for _, name := range []string{"profiles", ".credentials.yaml"} {
+		fi, err := os.Lstat(filepath.Join(iso, name))
+		if err != nil {
+			t.Fatalf("Lstat(%s): %v", name, err)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("expected %s to be replaced with a symlink, got mode %s", name, fi.Mode())
+		}
 	}
 }
 

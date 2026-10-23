@@ -801,7 +801,11 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		// it; the base patch reads DSH_PERMISSION_MODE. danger-full-access maps
 		// approval to 'never', which is the only preset that runs unattended —
 		// the headless bundle mounts no approval answerer, so 'ask' fails closed.
-		cmd.Env = dshEnvWithPermission(cmd.Env, job.DSHPermissionMode)
+		permMode := strings.TrimSpace(job.DSHPermissionMode)
+		if permMode == "" {
+			permMode = "danger-full-access"
+		}
+		cmd.Env = dshEnvWithPermission(cmd.Env, permMode)
 		if strings.TrimSpace(job.Model) != "" {
 			cmd.Env = append(cmd.Env, "DSH_MODEL="+strings.TrimSpace(job.Model))
 		}
@@ -861,7 +865,12 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		resolvedArgs = ompArgs(job)
 		cmd = commandFor(ctx, bin, append(resolvedArgs, prompt)...)
 	case "auto":
-		// Auto preserves the historical preference but remains explicit in the result.
+		// Auto prefers dsh (DeepSeek Harness) first for fast, session-continuous
+		// execution, falling back to other installed CLI executors.
+		if findBin("dsh") != "" {
+			job.Executor = "dsh"
+			return runJobWithProgress(job, onProgress)
+		}
 		if findBin("hermes") != "" {
 			job.Executor = "hermes"
 			return runJobWithProgress(job, onProgress)
@@ -2134,14 +2143,19 @@ func dshIsolatedHome() string {
 		return ""
 	}
 	shared := filepath.Join(home, ".dsh")
-	for _, name := range []string{"profiles", "settings.yaml", ".credentials.yaml", ".anonymous-user-id"} {
+	for _, name := range []string{"profiles", "settings.yaml", ".credentials.yaml", ".anonymous-user-id", "llm-deepseek"} {
 		src := filepath.Join(shared, name)
 		if _, err := os.Stat(src); err != nil {
 			continue
 		}
 		dst := filepath.Join(iso, name)
-		if _, err := os.Lstat(dst); err == nil {
-			continue
+		if fi, err := os.Lstat(dst); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				if target, readErr := os.Readlink(dst); readErr == nil && target == src {
+					continue
+				}
+			}
+			_ = os.RemoveAll(dst)
 		}
 		_ = os.Symlink(src, dst)
 	}
@@ -2149,6 +2163,9 @@ func dshIsolatedHome() string {
 }
 
 func findBin(name string) string {
+	if b, err := exec.LookPath(name); err == nil {
+		return b
+	}
 	for _, p := range binCandidates(runtime.GOOS, os.Getenv, name) {
 		if p == "" {
 			continue
@@ -2156,9 +2173,6 @@ func findBin(name string) string {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
-	}
-	if b, err := exec.LookPath(name); err == nil {
-		return b
 	}
 	return ""
 }
