@@ -2142,9 +2142,9 @@ func dshEnvWithPermission(env []string, mode string) []string {
 func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []string {
 	provider = strings.TrimSpace(provider)
 	// Control-plane passes the task assignee profile name (e.g. "default") in
-	// Provider unless an explicit DSH provider ("deepseek-account" or "adit-9router")
+	// Provider unless an explicit DSH provider ("deepseek-account", "deepseek", or "adit-9router")
 	// was selected. Normalize non-DSH profile names so DSH uses a valid adapter.
-	if provider != "deepseek-account" && provider != "adit-9router" {
+	if provider != "deepseek-account" && provider != "adit-9router" && provider != "deepseek" {
 		provider = ""
 	}
 	model = strings.TrimSpace(model)
@@ -2152,6 +2152,15 @@ func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []st
 	if strings.HasPrefix(model, "deepseek-account:") {
 		provider = "deepseek-account"
 		model = strings.TrimPrefix(model, "deepseek-account:")
+	} else if strings.HasPrefix(model, "deepseek-account/") {
+		provider = "deepseek-account"
+		model = strings.TrimPrefix(model, "deepseek-account/")
+	} else if strings.HasPrefix(model, "deepseek:") {
+		provider = "deepseek"
+		model = strings.TrimPrefix(model, "deepseek:")
+	} else if strings.HasPrefix(model, "deepseek/") {
+		provider = "deepseek"
+		model = strings.TrimPrefix(model, "deepseek/")
 	} else if strings.HasPrefix(model, "adit-9router:") {
 		provider = "adit-9router"
 		model = strings.TrimPrefix(model, "adit-9router:")
@@ -2159,12 +2168,13 @@ func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []st
 		provider = "adit-9router"
 		model = strings.TrimPrefix(model, "adit-9router/")
 	}
-	if model == "deepseek-v4.1-flash" || model == "deepseek/deepseek-v4.1-flash" || model == "deepseek-v4-flash" {
+	lowerModel := strings.ToLower(model)
+	if lowerModel == "deepseek-v4.1-flash" || lowerModel == "deepseek/deepseek-v4.1-flash" || lowerModel == "deepseek-v4-flash" {
 		if provider == "" || provider == "deepseek-account" {
 			model = "deepseek-flash"
 			provider = "deepseek-account"
 		}
-	} else if model == "deepseek-flash" || model == "deepseek-v4-pro" {
+	} else if lowerModel == "deepseek-flash" || lowerModel == "deepseek-v4-pro" {
 		if provider == "" {
 			provider = "deepseek-account"
 		}
