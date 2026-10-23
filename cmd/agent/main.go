@@ -2141,6 +2141,12 @@ func dshEnvWithPermission(env []string, mode string) []string {
 // by the headless profile's agent-default-model patch.
 func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []string {
 	provider = strings.TrimSpace(provider)
+	// Control-plane passes the task assignee profile name (e.g. "default") in
+	// Provider unless an explicit DSH provider ("deepseek-account" or "adit-9router")
+	// was selected. Normalize non-DSH profile names so DSH uses a valid adapter.
+	if provider != "deepseek-account" && provider != "adit-9router" {
+		provider = ""
+	}
 	model = strings.TrimSpace(model)
 	effort = strings.ToLower(strings.TrimSpace(effort))
 	if strings.HasPrefix(model, "deepseek-account:") {
@@ -2154,15 +2160,15 @@ func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []st
 		model = strings.TrimPrefix(model, "adit-9router/")
 	}
 	if model == "deepseek-v4.1-flash" || model == "deepseek/deepseek-v4.1-flash" || model == "deepseek-v4-flash" {
-		if provider == "" || provider == "deepseek-account" || provider == "deepseek" {
+		if provider == "" || provider == "deepseek-account" {
 			model = "deepseek-flash"
 			provider = "deepseek-account"
 		}
 	} else if model == "deepseek-flash" || model == "deepseek-v4-pro" {
-		if provider == "" || provider == "deepseek" {
+		if provider == "" {
 			provider = "deepseek-account"
 		}
-	} else if model != "" && (provider == "" || provider == "deepseek") {
+	} else if model != "" && provider == "" {
 		provider = "adit-9router"
 	}
 	if provider != "" {
