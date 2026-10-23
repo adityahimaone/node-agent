@@ -30,11 +30,15 @@ import (
 	"node-agent/internal/transport"
 )
 
-// httpClient is shared by register/heartbeat/result posts. The old code used
+// httpClient is shared by register/heartbeat/progress posts. The old code used
 // http.Post (= http.DefaultClient, no timeout) — if the tailnet stalls
 // (Mac sleep/wake, wifi switch) those calls could hang forever with no
 // retry, silently killing the heartbeat goroutine or the result post.
 var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+// resultClient is used for uploading job results, which may include multi-megabyte
+// executor transcripts that need more than 10s over a tailnet/DERP relay.
+var resultClient = &http.Client{Timeout: 30 * time.Second}
 
 // pollClient is separate because long-poll intentionally blocks up to ~25s
 // server-side; give it a bit of headroom instead of sharing the 10s client.
@@ -323,7 +327,7 @@ func runGRPC(server, target, nodeID string, wsPaths, executors []string, version
 			return err
 		}
 		start := time.Now()
-		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow}, func(phase, message string) {
+		output, ok, errStr := runExclusiveJob(transport.DispatchRequest{TaskID: job.TaskID, Board: job.Board, Message: job.Message, Workspace: job.Workspace, Model: job.Model, Provider: job.Provider, Executor: job.Executor, Command: job.Command, ExecutionMode: job.ExecutionMode, NoRTK: job.NoRTK, MaxIterations: job.MaxIterations, Acceptance: job.Acceptance, PrequestNote: job.PrequestNote, DSHSessionID: job.DSHSessionID, DSHWorkspaceID: job.DSHWorkspaceID, DSHPermissionMode: job.DSHPermissionMode, CommandCodeMode: job.CommandCodeMode, HarnessKind: job.HarnessKind, CommandCodeSessionID: job.CommandCodeSessionID, OMPSessionID: job.OMPSessionID, ClaudeSessionID: job.ClaudeSessionID, LastTurnSeq: job.LastTurnSeq, LastCommentID: job.LastCommentID, RunID: job.RunID, SessionContinuation: job.SessionContinuation, ConversationID: job.ConversationID, AppendOnly: job.AppendOnly, ContextWindow: job.ContextWindow, TimeoutS: job.TimeoutS}, func(phase, message string) {
 			if err := send(&transport.WorkerFrame{JobProgress: &transport.JobProgress{DeliveryID: job.DeliveryID, TaskID: job.TaskID, Phase: phase, Message: message}}); err != nil {
 				log.Printf("progress send: %v", err)
 			}
@@ -446,9 +450,7 @@ func postJSON(url string, v any) error {
 	return err
 }
 
-// postJSONBody is postJSON plus the response body. The heartbeat needs the
-// body (it carries the re-probe request); every other caller ignores it.
-func postJSONBody(url string, v any) ([]byte, error) {
+func postJSONWithClient(client *http.Client, url string, v any) ([]byte, error) {
 	b, _ := json.Marshal(v)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
 	if err != nil {
@@ -458,7 +460,7 @@ func postJSONBody(url string, v any) ([]byte, error) {
 	if agentToken != "" {
 		req.Header.Set("X-Node-Agent-Token", agentToken)
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -468,6 +470,12 @@ func postJSONBody(url string, v any) ([]byte, error) {
 		return nil, fmt.Errorf("%d %s", resp.StatusCode, string(bb))
 	}
 	return readAll(resp), nil
+}
+
+// postJSONBody is postJSON plus the response body. The heartbeat needs the
+// body (it carries the re-probe request); every other caller ignores it.
+func postJSONBody(url string, v any) ([]byte, error) {
+	return postJSONWithClient(httpClient, url, v)
 }
 
 // resultPostBackoff is the pause between result-delivery
@@ -482,7 +490,7 @@ var resultPostBackoff = 2 * time.Second
 func postResult(url string, v any) error {
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		if err = postJSON(url, v); err == nil {
+		if _, err = postJSONWithClient(resultClient, url, v); err == nil {
 			return nil
 		}
 		log.Printf("result post err (attempt %d/3): %v", attempt, err)
@@ -972,10 +980,13 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 	// Live-sync the session into the running daemon so the UI groups it under
 	// the workspace immediately — no restart (watcher) needed. Best-effort:
 	// a failure here must never abort an otherwise-finished dispatch.
+	// Use a fresh context rather than the job ctx, which may already be expired.
 	if executor == "dsh" && sessionID != "" {
-		if syncErr := syncDSHWebSession(ctx, sessionID, ws); syncErr != nil {
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if syncErr := syncDSHWebSession(syncCtx, sessionID, ws); syncErr != nil {
 			log.Printf("dsh web sync (soft): %v", syncErr)
 		}
+		syncCancel()
 	}
 
 	// Provenance header: first line of every result proves which binary ran.
@@ -1027,7 +1038,7 @@ func runJobWithProgressAttempt(job transport.DispatchRequest, onProgress func(st
 		_ = convStore.AppendMessage(convID, "assistant", string(out))
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return string(out), false, fmt.Sprintf("node_agent_job_timeout: job timed out after %s", jobTimeout())
+		return string(out), false, fmt.Sprintf("node_agent_job_timeout: job timed out after %s", jobDeadline)
 	}
 	if err != nil {
 		return string(out), false, err.Error()
@@ -1679,13 +1690,20 @@ func findBinAny(names ...string) string {
 // space — and Kanban prompts always do. Such a shim is therefore resolved to the
 // node invocation it wraps (see resolveNpmShim). Everything else runs directly.
 func commandFor(ctx context.Context, bin string, args ...string) *exec.Cmd {
+	var cmd *exec.Cmd
 	if shim, ok := resolveNpmShim(bin); ok {
 		nodeArgs := make([]string, 0, len(args)+1)
 		nodeArgs = append(nodeArgs, shim.Entry)
 		nodeArgs = append(nodeArgs, args...)
-		return exec.CommandContext(ctx, shim.Node, nodeArgs...)
+		cmd = exec.CommandContext(ctx, shim.Node, nodeArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, bin, args...)
 	}
-	return exec.CommandContext(ctx, bin, args...)
+	// Ensure background child processes holding inherited stdout/stderr pipes
+	// cannot block cmd.Wait() indefinitely after the context expires or the main
+	// agent process exits.
+	cmd.WaitDelay = 5 * time.Second
+	return cmd
 }
 
 func detectExecutors() ([]string, map[string]string) {

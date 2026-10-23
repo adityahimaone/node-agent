@@ -95,9 +95,12 @@ type DispatchJob struct {
 	LeaseExpiresAtUnixMs int64  `json:"lease_expires_at_unix_ms"`
 	// Persistent chat fields. ConversationID empty => server/agent auto-resolves
 	// per workspace. AppendOnly=false means reset context before this message.
-	ConversationID string `json:"conversation_id,omitempty"`
-	AppendOnly     bool   `json:"append_only,omitempty"`
-	ContextWindow  int    `json:"context_window,omitempty"`
+	ConversationID    string `json:"conversation_id,omitempty"`
+	AppendOnly        bool   `json:"append_only,omitempty"`
+	ContextWindow     int    `json:"context_window,omitempty"`
+	DSHPermissionMode string `json:"dsh_permission_mode,omitempty"`
+	CommandCodeMode   string `json:"commandcode_mode,omitempty"`
+	TimeoutS          int    `json:"timeout_s,omitempty"`
 }
 type ResultAck struct {
 	DeliveryID string `json:"delivery_id"`
