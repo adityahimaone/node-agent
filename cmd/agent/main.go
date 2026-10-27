@@ -1760,9 +1760,9 @@ func detectExecutors() ([]string, map[string]string) {
 // that are not dispatchable executors but whose presence and release the
 // fleet card reports per worker device.
 type toolProbe struct {
-	name   string
-	bins   []string
-	args   []string
+	name string
+	bins []string
+	args []string
 	// node marks a tool installed as a Node CLI: its shebang resolves `node`
 	// through PATH, which launchd does not carry, so the probe runs with the
 	// same PATH prepend the dispatch path uses.
@@ -2049,7 +2049,12 @@ func rewriteShellCmd(raw string) string {
 		cmd := exec.CommandContext(ctx, bin, args...)
 		out, _ := cmd.CombinedOutput()
 		s := strings.TrimSpace(string(out))
-		if s == "" || strings.HasPrefix(s, "No rewrite for:") {
+		// An uninitialised rtk prints a banner to stdout before its
+		// "No rewrite for:" line. The old prefix-only check accepted that
+		// banner as the rewritten command, so bash tried to execute
+		// "[rtk]" and the real command never ran. Any banner marker means
+		// "no rewrite", regardless of where it appears.
+		if s == "" || strings.Contains(s, "No rewrite for:") || strings.Contains(s, "[rtk]") {
 			return "", false
 		}
 		return s, true
@@ -2064,7 +2069,14 @@ func rewriteShellCmd(raw string) string {
 }
 
 func validateDSHBinary(bin string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The DSH web profile is the runtime the job actually drives. If it is
+	// already listening, a slow --version probe (some versions boot the plugin
+	// tree even for --version) is not a reason to block the card before the
+	// real bounded invocation can decide.
+	if dshWebAvailable() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "--version")
 	// launchd starts the worker with a minimal PATH. dsh is a Node launcher,
@@ -2073,9 +2085,6 @@ func validateDSHBinary(bin string) error {
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		if dshWebAvailable() {
-			// Some DSH versions boot the plugin tree even for --version and can
-			// exceed this probe timeout while the already-running web profile is
-			// healthy. Let the real bounded headless invocation decide instead.
 			return nil
 		}
 		return fmt.Errorf("binary health check timed out (DSH Web/Harness may be unavailable)")
