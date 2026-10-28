@@ -17,11 +17,11 @@ func TestHeartbeatOnceReportsRefreshRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	refresh, err := heartbeatOnce(srv.URL, "node-1", "idle", nil)
+	resp, err := heartbeatOnce(srv.URL, "node-1", "idle", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("heartbeatOnce: %v", err)
 	}
-	if !refresh {
+	if !resp.Refresh {
 		t.Fatal("refresh=true in the heartbeat response must request a re-probe")
 	}
 	if got := posts.Load(); got != 1 {
@@ -37,11 +37,11 @@ func TestHeartbeatOnceIgnoresUnparsableBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	refresh, err := heartbeatOnce(srv.URL, "node-1", "idle", nil)
+	resp, err := heartbeatOnce(srv.URL, "node-1", "idle", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("heartbeatOnce: %v", err)
 	}
-	if refresh {
+	if resp.Refresh {
 		t.Fatal("a non-JSON body must not request a refresh")
 	}
 }

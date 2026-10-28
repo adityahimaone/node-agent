@@ -1136,3 +1136,27 @@ func TestNpmGlobalRelease(t *testing.T) {
 		t.Errorf("npmGlobalRelease for a native bin = %q, want empty", got)
 	}
 }
+
+// An nvm-installed CLI is invisible to a launchd PATH, which is exactly how the
+// Command Code catalog came back "cmd not found" on a node that could run cmd.
+func TestFindBinFindsNVMInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	anyVersion := filepath.Join(home, ".nvm", "versions", "node")
+	for _, version := range []string{"v9.1.0", "v24.22.1", "v18.20.0"} {
+		dir := filepath.Join(home, ".nvm", "versions", "node", version, "bin")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "kanban-test-nvm-tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := findBin("kanban-test-nvm-tool")
+	if got == "" {
+		t.Fatal("findBin found nothing; an nvm-only install must still resolve")
+	}
+	if !strings.HasPrefix(got, anyVersion) {
+		t.Fatalf("findBin = %q, want a path under %q", got, anyVersion)
+	}
+}

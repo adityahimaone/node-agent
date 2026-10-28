@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -211,8 +212,14 @@ func main() {
 
 func heartbeatLoop(server, nodeID string, reRegister func() error) {
 	dshCache := heartbeat.NewDSHProbeCache(60 * time.Second)
+	prober := newModelProber()
+	// want survives the loop body: the payload for a wanted catalog rides the
+	// NEXT beat, and the beat after a request is brought forward so the create
+	// task modal does not sit on a 15 s "fetching models" spinner.
+	var want []string
+	wait := heartbeatInterval
 	for {
-		time.Sleep(heartbeatInterval)
+		time.Sleep(wait)
 		status := "idle"
 		if atomic.LoadInt32(&busy) == 1 {
 			status = "busy"
@@ -222,11 +229,25 @@ func heartbeatLoop(server, nodeID string, reRegister func() error) {
 			h := dshCache.Get(dshBin)
 			dsh = &h
 		}
-		refresh, err := heartbeatOnce(server, nodeID, status, dsh)
+		summaries, payloads := prober.beat(want)
+		if len(want) > 0 {
+			keys := make([]string, 0, len(payloads))
+			for k := range payloads {
+				keys = append(keys, k)
+			}
+			log.Printf("models: asked for %v, sending %v", want, keys)
+		}
+		resp, err := heartbeatOnce(server, nodeID, status, dsh, summaries, payloads)
 		if err != nil {
+			wait = heartbeatInterval
 			continue
 		}
-		if refresh && reRegister != nil {
+		want = resp.WantModels
+		wait = heartbeatInterval
+		if len(want) > 0 {
+			wait = 300 * time.Millisecond
+		}
+		if resp.Refresh && reRegister != nil {
 			if err := reRegister(); err != nil {
 				log.Printf("refresh re-register: %v", err)
 			} else {
@@ -246,21 +267,27 @@ var heartbeatInterval = 15 * time.Second
 // version re-probe. Only a literal JSON `refresh: true` counts: an older
 // server answers `{"status":"ok"}` (and some middleboxes answer HTML), and
 // re-registering on an unparsable body would hammer the control plane.
-func heartbeatOnce(server, nodeID, status string, dsh *heartbeat.DSHHealth) (bool, error) {
-	body, err := postJSONBody(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{NodeID: nodeID, Status: status, DSHHealth: dsh})
+func heartbeatOnce(server, nodeID, status string, dsh *heartbeat.DSHHealth, sums map[string]heartbeat.ModelSummary, payloads map[string]heartbeat.ModelCatalog) (transport.HeartbeatResponse, error) {
+	body, err := postJSONBody(server+"/api/nodes/"+nodeID+"/heartbeat", transport.HeartbeatRequest{
+		NodeID:         nodeID,
+		Status:         status,
+		DSHHealth:      dsh,
+		ModelSummaries: sums,
+		ModelPayloads:  payloads,
+	})
+	var resp transport.HeartbeatResponse
 	if err != nil {
-		return false, err
+		return resp, err
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
-		return false, nil
+		return resp, nil
 	}
-	var resp struct {
-		Refresh bool `json:"refresh"`
-	}
+	// An older server answers {"status":"ok"} and some middleboxes answer HTML;
+	// a body we cannot parse must not be read as a request.
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return false, nil
+		return transport.HeartbeatResponse{}, nil
 	}
-	return resp.Refresh, nil
+	return resp, nil
 }
 
 func contains(s, sub string) bool { return bytes.Contains([]byte(s), []byte(sub)) }
@@ -2148,12 +2175,26 @@ func dshEnvWithPermission(env []string, mode string) []string {
 // dshEnvWithModelAndEffort maps the dispatched provider, model, and effort into
 // DSH_PROVIDER, DSH_MODEL, and DSH_REASONING_EFFORT environment variables read
 // by the headless profile's agent-default-model patch.
+// isKnownDSHProvider reports whether name is a provider the local dsh install
+// can actually resolve. adit-router is the provider the shipped web profile
+// declares; adit-9router is what the headless router profile declares. Cards
+// carry "<provider>/<model>", so an unlisted provider here would silently
+// rewrite the operator's choice to adit-9router and run the wrong model.
+func isKnownDSHProvider(name string) bool {
+	switch name {
+	case "deepseek", "deepseek-account", "deepseek-official", "adit-9router", "adit-router",
+		"gemini", "our-free-model", "opencode", "openrouter":
+		return true
+	}
+	return false
+}
+
 func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []string {
 	provider = strings.TrimSpace(provider)
 	// Control-plane passes the task assignee profile name (e.g. "default") in
 	// Provider unless an explicit DSH provider ("deepseek-account", "deepseek", or "adit-9router")
 	// was selected. Normalize non-DSH profile names so DSH uses a valid adapter.
-	if provider != "deepseek-account" && provider != "adit-9router" && provider != "deepseek" {
+	if !isKnownDSHProvider(provider) {
 		provider = ""
 	}
 	model = strings.TrimSpace(model)
@@ -2176,6 +2217,12 @@ func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []st
 	} else if strings.HasPrefix(model, "adit-9router/") {
 		provider = "adit-9router"
 		model = strings.TrimPrefix(model, "adit-9router/")
+	} else if strings.HasPrefix(model, "adit-router:") {
+		provider = "adit-router"
+		model = strings.TrimPrefix(model, "adit-router:")
+	} else if strings.HasPrefix(model, "adit-router/") {
+		provider = "adit-router"
+		model = strings.TrimPrefix(model, "adit-router/")
 	}
 	lowerModel := strings.ToLower(model)
 	if lowerModel == "deepseek-v4.1-flash" || lowerModel == "deepseek/deepseek-v4.1-flash" || lowerModel == "deepseek-v4-flash" {
@@ -2188,6 +2235,13 @@ func dshEnvWithModelAndEffort(env []string, provider, model, effort string) []st
 			provider = "deepseek-account"
 		}
 	} else if model != "" && provider == "" {
+		provider = "adit-9router"
+	}
+	// The picker reads the running host's live catalog, where the router provider
+	// is named adit-router (the web profile's name for it). A card runs the
+	// headless profile, which declares the same router as adit-9router, so the
+	// provider is translated rather than the operator's choice thrown away.
+	if provider == "adit-router" {
 		provider = "adit-9router"
 	}
 	if provider != "" {
@@ -2257,6 +2311,30 @@ func findBin(name string) string {
 		}
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
+		}
+	}
+	// Versioned package-manager prefixes. A node installed through nvm puts its
+	// binaries under ~/.nvm/versions/node/<version>/bin, which no fixed candidate
+	// list can name; npm -g on Windows lands in %APPDATA%\npm. Measured need: the
+	// Command Code CLI resolved in a terminal but not under launchd, so the node
+	// advertised "cmd not found" while the same node could run it.
+	patterns := []string{
+		filepath.Join(os.Getenv("HOME"), ".nvm", "versions", "node", "*", "bin", name),
+		filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming", "npm", name+".cmd"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil || len(matches) == 0 {
+			continue
+		}
+		// Any installed version of the tool will do — the catalog is the same for
+		// all of them — so the first existing match wins. Picking "newest" would
+		// need real version comparison for no benefit.
+		sort.Strings(matches)
+		for _, match := range matches {
+			if st, err := os.Stat(match); err == nil && !st.IsDir() {
+				return match
+			}
 		}
 	}
 	return ""

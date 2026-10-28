@@ -27,6 +27,20 @@ type HeartbeatRequest struct {
 	NodeID    string               `json:"node_id"`
 	Status    string               `json:"status"` // idle|busy
 	DSHHealth *heartbeat.DSHHealth `json:"dsh_health,omitempty"`
+	// ModelSummaries is advertised every beat (etag + count per catalog).
+	ModelSummaries map[string]heartbeat.ModelSummary `json:"model_summaries,omitempty"`
+	// ModelPayloads carries full lists only when the control plane asked for a
+	// key. Keyed by catalog key: executor, or executor:profile for dsh.
+	ModelPayloads map[string]heartbeat.ModelCatalog `json:"model_payloads,omitempty"`
+}
+
+// HeartbeatResponse tells the worker what the control plane still wants.
+type HeartbeatResponse struct {
+	Status string `json:"status"`
+	// Refresh asks for a version re-probe after an upgrade.
+	Refresh bool `json:"refresh"`
+	// WantModels lists catalog keys whose payload the control plane lacks.
+	WantModels []string `json:"want_models,omitempty"`
 }
 
 // Dispatch — server -> agent

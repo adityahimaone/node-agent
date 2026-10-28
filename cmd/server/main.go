@@ -251,14 +251,112 @@ func main() {
 		id := chi.URLParam(r, "id")
 		var req transport.HeartbeatRequest
 		_ = transport.ReadJSON(r, &req)
-		if !reg.HeartbeatWithHealth(id, req.Status, req.DSHHealth) {
+		// Payloads land before the heartbeat so the want-list computed below
+		// already sees them: a worker that just delivered its catalog must not
+		// be asked for it again on the same beat.
+		if len(req.ModelPayloads) > 0 {
+			keys := make([]string, 0, len(req.ModelPayloads))
+			for k := range req.ModelPayloads {
+				keys = append(keys, k)
+			}
+			sk := make([]string, 0, len(req.ModelSummaries))
+			for k := range req.ModelSummaries {
+				sk = append(sk, k)
+			}
+			log.Printf("heartbeat %s: summaries=%v payloads=%v", id, sk, keys)
+		}
+		for _, cat := range req.ModelPayloads {
+			reg.SetModelCatalog(id, cat)
+		}
+		if !reg.HeartbeatWithState(id, req.Status, req.DSHHealth, req.ModelSummaries) {
 			http.Error(w, "unknown node", 404)
 			return
 		}
-		// refresh=true is the agent's cue to re-probe versions and
-		// re-register; the flag is consumed here so only one heartbeat is
-		// answered with it.
-		transport.WriteJSON(w, 200, map[string]any{"status": "ok", "refresh": reg.ConsumeRefresh(id)})
+		// refresh/want_models are one-shot cues consumed here so only a single
+		// heartbeat is answered with them.
+		transport.WriteJSON(w, 200, transport.HeartbeatResponse{
+			Status:     "ok",
+			Refresh:    reg.ConsumeRefresh(id),
+			WantModels: reg.ConsumeWantedModels(id),
+		})
+	})
+	// The models menu asks for a re-probe without waiting for the next beat.
+	r.Post("/api/nodes/{id}/models/refresh", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		var body struct {
+			Key string `json:"key"`
+		}
+		_ = transport.ReadJSON(r, &body)
+		if !reg.RequestModelRefresh(id, body.Key) {
+			http.Error(w, "unknown node", 404)
+			return
+		}
+		transport.WriteJSON(w, 200, map[string]any{"status": "ok"})
+	})
+	r.Post("/api/models/refresh", func(w http.ResponseWriter, r *http.Request) {
+		transport.WriteJSON(w, 200, map[string]any{"status": "ok", "requested": reg.RequestAllModelRefresh()})
+	})
+	// Model catalog for the create-task picker. The answer is owned by the node
+	// that would actually run the card: a dsh list from the wrong profile is
+	// what made the modal disagree with the worker in the first place.
+	r.Get("/api/models", func(w http.ResponseWriter, r *http.Request) {
+		executor := strings.TrimSpace(r.URL.Query().Get("executor"))
+		workspace := strings.TrimSpace(r.URL.Query().Get("workspace"))
+		profile := strings.TrimSpace(r.URL.Query().Get("profile"))
+		if executor == "" {
+			executor = "dsh"
+		}
+		if executor == "cmd" {
+			executor = "commandcode"
+		}
+		if profile == "" && executor == "dsh" {
+			profile = "headless"
+		}
+		key := executor
+		if profile != "" {
+			key = executor + ":" + profile
+		}
+		nodeID := strings.TrimSpace(r.URL.Query().Get("node"))
+		if nodeID == "" {
+			id, code, err := pickDispatchNode(reg.List(), workspace, executor)
+			if err != nil {
+				transport.WriteJSON(w, code, map[string]any{
+					"executor": executor,
+					"profile":  profile,
+					"source":   "unavailable",
+					"detail":   err.Error(),
+					"models":   []heartbeat.ModelEntry{},
+				})
+				return
+			}
+			nodeID = id
+		}
+		if r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true" {
+			reg.RequestModelRefresh(nodeID, key)
+		}
+		cat, ok := reg.ModelCatalog(nodeID, key)
+		if !ok {
+			transport.WriteJSON(w, 200, map[string]any{
+				"executor":   executor,
+				"profile":    profile,
+				"node_id":    nodeID,
+				"source":     "pending",
+				"detail":     "node has not reported this catalog yet",
+				"fetched_at": 0,
+				"models":     []heartbeat.ModelEntry{},
+			})
+			return
+		}
+		transport.WriteJSON(w, 200, map[string]any{
+			"executor":   executor,
+			"profile":    cat.Profile,
+			"node_id":    nodeID,
+			"source":     cat.Source,
+			"detail":     cat.Detail,
+			"fetched_at": cat.FetchedAt,
+			"etag":       cat.ETag,
+			"models":     cat.Models,
+		})
 	})
 	r.Get("/api/nodes/{id}/poll", func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
