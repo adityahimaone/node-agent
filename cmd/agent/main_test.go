@@ -144,6 +144,7 @@ func TestRegisterDeepSeekHarnessWorkspaceFailsClosedOnUnwritableRegistry(t *test
 }
 
 func TestValidateDSHBinary(t *testing.T) {
+	t.Setenv("NODE_AGENT_DSH_WEB_URL", "http://127.0.0.1:1/")
 	bin := filepath.Join(t.TempDir(), "dsh")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho dsh-test-version\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -154,12 +155,27 @@ func TestValidateDSHBinary(t *testing.T) {
 }
 
 func TestValidateDSHBinaryRejectsFailingBinary(t *testing.T) {
+	t.Setenv("NODE_AGENT_DSH_WEB_URL", "http://127.0.0.1:1/")
 	bin := filepath.Join(t.TempDir(), "dsh")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho dsh-web-off >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateDSHBinary(bin); err == nil || !strings.Contains(err.Error(), "binary health check failed") {
 		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
+func TestValidateDSHBinaryAcceptsRunningWeb(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("NODE_AGENT_DSH_WEB_URL", server.URL)
+
+	// The web profile is the runtime; a slow/flaky --version probe must not
+	// block a card while the harness is demonstrably up.
+	if err := validateDSHBinary("/nonexistent/dsh"); err != nil {
+		t.Fatalf("running web profile should satisfy the health check: %v", err)
 	}
 }
 
@@ -708,6 +724,20 @@ func TestRewriteShellCmdDisabled(t *testing.T) {
 	t.Setenv("NODE_AGENT_NO_RTK", "1")
 	if got := rewriteShellCmd("git status"); got != "git status" {
 		t.Fatalf("disabled: got %q, want raw", got)
+	}
+}
+
+func TestRewriteShellCmdIgnoresRTKBanner(t *testing.T) {
+	dir := t.TempDir()
+	rtk := filepath.Join(dir, "rtk")
+	banner := "#!/bin/sh\nprintf '%s\\n' '[rtk] /!\\\\ No hook installed - run rtk init -g' 'No rewrite for: echo hi'\n"
+	if err := os.WriteFile(rtk, []byte(banner), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if got := rewriteShellCmd("echo hi"); got != "echo hi" {
+		t.Fatalf("rtk banner was accepted as a rewritten command: got %q, want raw", got)
 	}
 }
 
